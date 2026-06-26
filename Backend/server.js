@@ -3214,26 +3214,71 @@ app.post('/api/upload/course-resources', authenticateToken, requireInstructor, u
     try {
         if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-        const b64 = Buffer.from(req.file.buffer).toString('base64');
-        const dataURI = "data:" + req.file.mimetype + ";base64," + b64;
+        const mime = req.file.mimetype || '';
+        const fileName = req.file.originalname || '';
+        const ext = fileName.split('.').pop()?.toLowerCase() || '';
 
-        console.log(`[System] Instructor ${req.user.id} uploading course resource to Cloudinary...`);
+        // Determine the correct Cloudinary resource_type:
+        //   - 'image' for images
+        //   - 'video' for video/audio files
+        //   - 'raw'   for everything else (PDF, PPT, PPTX, DOC, DOCX, ZIP, etc.)
+        //   Using 'auto' fails for non-image binary files in many Cloudinary plans.
+        let resourceType = 'raw';
+        if (mime.startsWith('image/')) {
+            resourceType = 'image';
+        } else if (mime.startsWith('video/') || mime.startsWith('audio/')) {
+            resourceType = 'video';
+        }
 
-        const result = await cloudinary.uploader.upload(dataURI, {
-            folder: 'course_resources',
-            resource_type: 'auto'
+        // Use a safe public_id (no extension – Cloudinary adds it for raw)
+        const safeBaseName = fileName
+            .replace(/\.[^/.]+$/, '')           // strip extension
+            .replace(/[^a-zA-Z0-9_\-]/g, '_')  // sanitize
+            .substring(0, 100);
+
+        const publicId = `course_resources/${Date.now()}_${safeBaseName}`;
+
+        console.log(`[System] Instructor ${req.user.id} uploading "${fileName}" (${mime}) as resource_type="${resourceType}" to Cloudinary...`);
+
+        // Upload as a stream from buffer (avoids base64 size bloat for large files)
+        const uploadResult = await new Promise((resolve, reject) => {
+            const uploadStream = cloudinary.uploader.upload_stream(
+                {
+                    folder: 'course_resources',
+                    public_id: publicId,
+                    resource_type: resourceType,
+                    use_filename: false,
+                    overwrite: false,
+                    // For raw files, preserve the original extension so browsers
+                    // can open/download them with the correct type
+                    ...(resourceType === 'raw' ? { format: ext } : {})
+                },
+                (error, result) => {
+                    if (error) return reject(error);
+                    resolve(result);
+                }
+            );
+            uploadStream.end(req.file.buffer);
         });
+
+        const result = uploadResult;
+
+        console.log(`[System] Upload success: ${result.secure_url}`);
 
         res.json({
             url: result.secure_url,
             public_id: result.public_id,
-            format: result.format,
-            original_filename: req.file.originalname,
+            format: result.format || ext,
+            original_filename: fileName,
             view_url: result.secure_url
         });
     } catch (err) {
         console.error('Resource upload failed:', err);
-        handleError(res, err, 'upload-resource');
+        // Always return JSON so the frontend can parse the error message correctly
+        res.status(500).json({
+            error: err.message || 'Upload failed. Please try again.',
+            context: 'upload-resource'
+        });
     }
 });
 

@@ -12,6 +12,14 @@ export default defineConfig(({ mode }) => ({
       host: "localhost",
       protocol: "ws",
     },
+    proxy: {
+      // Any request to /api/* gets forwarded to the Express backend
+      '/api': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+        secure: false,
+      },
+    },
   },
   optimizeDeps: {
     include: ["@zoom/meetingsdk"],

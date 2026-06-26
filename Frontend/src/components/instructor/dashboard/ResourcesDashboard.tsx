@@ -55,7 +55,7 @@ import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from '@/hooks/use-toast';
-import { fetchWithAuth } from '@/lib/api';
+import { fetchWithAuth, API_URL } from '@/lib/api';
 import { 
   useResources, 
   useCreateResource, 
@@ -176,13 +176,18 @@ export function ResourcesDashboard() {
     setUploading(true);
     setUploadProgress(0);
     setCurrentUploadingFile(file.name);
+
+    // Simulate progress since fetch doesn't expose upload progress natively
+    const progressInterval = setInterval(() => {
+        setUploadProgress(prev => (prev < 85 ? prev + Math.floor(Math.random() * 10) + 5 : prev));
+    }, 600);
+
     try {
         const formData = new FormData();
         formData.append('file', file);
 
-        // Call the new Backend API endpoint for storage upload
         const token = localStorage.getItem('access_token');
-        const res = await fetch(`${import.meta.env.VITE_API_URL || '/api'}/upload/course-resources`, {
+        const res = await fetch(`${API_URL}/upload/course-resources`, {
             method: 'POST',
             headers: {
                 Authorization: `Bearer ${token}`
@@ -190,17 +195,38 @@ export function ResourcesDashboard() {
             body: formData
         });
 
-        if (!res.ok) {
-            const err = await res.json();
-            throw new Error(err.error || 'Upload failed');
+        // Safely parse response — server may return HTML on proxy/timeout errors
+        let data: Record<string, unknown> = {};
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+            data = await res.json();
+        } else {
+            const text = await res.text();
+            console.error('Non-JSON response from server:', text);
+            throw new Error(
+                res.status === 413
+                    ? `File is too large. Please upload files under 100MB.`
+                    : res.status === 401 || res.status === 403
+                    ? `You don't have permission to upload resources.`
+                    : `Server returned an unexpected response (${res.status}). Please try again.`
+            );
         }
 
-        const { url: publicUrl } = await res.json();
+        if (!res.ok) {
+            throw new Error((data.error as string) || `Upload failed (${res.status})`);
+        }
 
-        // Open Dialog to confirm metadata
+        const publicUrl = data.url as string;
+        if (!publicUrl) {
+            throw new Error('Server did not return a file URL. Please try again.');
+        }
+
+        setUploadProgress(100);
+
+        // Open metadata dialog
         setPendingResource({ file, publicUrl, filePath: publicUrl });
         setResourceFormData({
-            title: file.name,
+            title: file.name.replace(/\.[^/.]+$/, ''), // strip extension from default title
             description: `Resource for course ${selectedCourse.title}`,
             resource_type: getResourceType(file.type || '', file.name) as CourseResource['resource_type'],
             category: '',
@@ -213,10 +239,11 @@ export function ResourcesDashboard() {
         console.error('Upload error:', err);
         toast({
             title: 'Upload failed',
-            description: `Failed to upload ${file.name}. ${err.message}`,
+            description: `Failed to upload "${file.name}". ${err.message}`,
             variant: 'destructive'
         });
     } finally {
+        clearInterval(progressInterval);
         setUploading(false);
         setUploadFiles([]);
     }

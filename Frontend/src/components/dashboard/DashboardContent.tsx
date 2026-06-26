@@ -1303,12 +1303,11 @@ export function DashboardContent({ basePath = "/student-dashboard" }: { basePath
             
             <div className="lg:ml-auto flex flex-col lg:flex-row items-stretch lg:items-center gap-3 w-full lg:w-auto min-w-0">
               {currentPath === "/student-dashboard/courses" && (
-                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 w-full lg:w-auto min-w-0 overflow-hidden">
-                    {/* Batch Selector — internal scroll, never overflows */}
-                    <div className="flex-1 min-w-0 overflow-hidden">
-                      <StudentBatchSelector />
-                    </div>
-                    <Button 
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 w-full lg:w-auto min-w-0">
+                    {/* Course selector only */}
+                    <StudentBatchSelector />
+                    {/* Pulse Your Rating */}
+                    <Button
                       variant="outline"
                       onClick={() => {
                         setSelectedCourseForRating({ id: 'GENERAL', title: 'AOTMS Pro Academy' });
