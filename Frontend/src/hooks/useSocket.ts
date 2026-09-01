@@ -4,11 +4,7 @@ import { useAuth } from './useAuth';
 
 // Determine the base URL for the socket connection
 const getSocketUrl = () => {
-  const envUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_RENDER_URL;
-  if (!envUrl) {
-    return typeof window !== 'undefined' ? window.location.origin : '';
-  }
-  const apiUrl = envUrl.trim();
+  const apiUrl = (import.meta.env.VITE_API_URL || import.meta.env.VITE_RENDER_URL || 'http://localhost:5000').trim();
   return apiUrl.replace(/\/api\/?$/, '').replace(/\/+$/, '');
 };
 

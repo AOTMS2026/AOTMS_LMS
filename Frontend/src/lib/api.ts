@@ -1,18 +1,17 @@
 /**
  * Normalizes the backend base URL so that it always points to the '/api' prefix,
- * preventing 404 HTML responses or duplicated hostnames (e.g. 187.53.134.243/187.53.134.243/api).
+ * preventing 404 HTML responses that trigger "Unexpected token '<', <!DOCTYPE" syntax errors.
  */
 const getBaseApiUrl = (): string => {
-  const envUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_RENDER_URL;
-  if (!envUrl) {
-    return "/api";
-  }
-  const trimmed = envUrl.trim().replace(/\/+$/, "");
-  // If envUrl does not start with http://, https://, or /, default safely to relative "/api"
-  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://") && !trimmed.startsWith("/")) {
-    return "/api";
-  }
-  return trimmed.endsWith("/api") ? trimmed : `${trimmed}/api`;
+  const envUrl = (
+    import.meta.env.VITE_API_URL ||
+    import.meta.env.VITE_RENDER_URL ||
+    "http://localhost:5000/api"
+  )
+    .trim()
+    .replace(/\/+$/, "");
+
+  return envUrl.endsWith("/api") ? envUrl : `${envUrl}/api`;
 };
 
 export const API_URL = getBaseApiUrl();
@@ -137,7 +136,7 @@ export const fetchWithAuth = async <T = unknown>(
     return h;
   };
 
-  const endpoint = url.startsWith("http") ? url : `${API_URL}${url.startsWith("/") ? "" : "/"}${url}`;
+  const endpoint = url.startsWith("http") ? url : `${API_URL}${url}`;
 
   let res: Response;
   try {
