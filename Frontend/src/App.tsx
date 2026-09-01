@@ -11,28 +11,31 @@ import {
 } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { SocketProvider } from "@/hooks/useSocket";
-import { useEffect, useRef, useState } from "react";
-import Home from "./pages/Home";
-import Auth from "./pages/Auth";
-import InstructorRegister from "./pages/InstructorRegister";
-import Dashboard from "./pages/Dashboard";
-import InstructorDashboard from "./pages/InstructorDashboard";
-import AdminDashboard from "./pages/AdminDashboard";
-import ManagerDashboard from "./pages/ManagerDashboard";
-import LiveSession from "./pages/LiveSession";
-import NotFound from "./pages/NotFound";
-import About from "./pages/About";
-import PendingApproval from "./pages/PendingApproval";
-import Courses from "./pages/Courses";
-import FAQ from "./pages/FAQ";
-import Contact from "./pages/Contact";
-import Privacy from "./pages/Privacy";
-import Terms from "./pages/Terms";
-import Docs from "./pages/Docs";
-import Careers from "./pages/Careers";
-import Trainers from "./pages/Trainers";
-import Press from "./pages/Press";
-import Features from "./pages/Features";
+import { useEffect, useRef, useState, lazy, Suspense } from "react";
+
+// Code-split pages with React.lazy
+const Home = lazy(() => import("./pages/Home"));
+const Auth = lazy(() => import("./pages/Auth"));
+const InstructorRegister = lazy(() => import("./pages/InstructorRegister"));
+const Dashboard = lazy(() => import("./pages/Dashboard"));
+const InternDashboard = lazy(() => import("./pages/Interndashboard"));
+const InstructorDashboard = lazy(() => import("./pages/InstructorDashboard"));
+const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
+const ManagerDashboard = lazy(() => import("./pages/ManagerDashboard"));
+const LiveSession = lazy(() => import("./pages/LiveSession"));
+const NotFound = lazy(() => import("./pages/NotFound"));
+const About = lazy(() => import("./pages/About"));
+const PendingApproval = lazy(() => import("./pages/PendingApproval"));
+const Courses = lazy(() => import("./pages/Courses"));
+const FAQ = lazy(() => import("./pages/FAQ"));
+const Contact = lazy(() => import("./pages/Contact"));
+const Privacy = lazy(() => import("./pages/Privacy"));
+const Terms = lazy(() => import("./pages/Terms"));
+const Docs = lazy(() => import("./pages/Docs"));
+const Careers = lazy(() => import("./pages/Careers"));
+const Trainers = lazy(() => import("./pages/Trainers"));
+const Press = lazy(() => import("./pages/Press"));
+const Features = lazy(() => import("./pages/Features"));
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 import ScrollToTop from "@/components/ScrollToTop";
 import { SuspensionOverlay } from "@/components/auth/SuspensionOverlay";
@@ -60,6 +63,7 @@ const BackNavigationHandler = () => {
     const handlePopState = (event: PopStateEvent) => {
       const dashboardMap: Record<string, string> = {
         student: "/student-dashboard",
+        intern: "/intern-dashboard",
         instructor: "/instructor",
         admin: "/admin",
         manager: "/manager",
@@ -75,14 +79,14 @@ const BackNavigationHandler = () => {
       }
     };
 
-    // Commenting out pushState as it interferes with React Router 6.
-    // window.history.pushState(null, "", window.location.href);
+    // Add a state to history so we can intercept the back button
+    window.history.pushState(null, "", window.location.href);
     window.addEventListener("popstate", handlePopState);
 
     return () => {
       window.removeEventListener("popstate", handlePopState);
     };
-  }, [userRole, user, loading, navigate, location.pathname]);
+  }, [user, userRole, loading, navigate, location.pathname]);
 
   return null;
 };
@@ -99,6 +103,7 @@ const RoleRedirector = () => {
     // Redirection Map
     const dashboardMap: Record<string, string> = {
       student: "/student-dashboard",
+      intern: "/intern-dashboard",
       instructor: "/instructor",
       admin: "/admin",
       manager: "/manager",
@@ -116,20 +121,23 @@ const RoleRedirector = () => {
       }
     }
     // 2. Handle Initial Load / Wrong Page
-    // Only redirect away from /auth if already logged in.
-    // We stay on '/' (Home) because the user wants to see the landing page even when logged in.
     else if (location.pathname === "/auth") {
       if (target) navigate(target);
     }
-    // Force specific redirection for non-students if they wander into the student area
-    // This ensures that when a role changes (e.g. Student -> Instructor), they are bumped to their portal
+    // Force specific redirection for non-students/non-interns if they wander into wrong area
     else if (
       userRole !== "student" &&
       location.pathname.startsWith("/student-dashboard")
     ) {
-      // Allow admins to view student dashboard if explicitly needed, but for now we redirect
-      // to ensure the "role change" creates a visible "rooting change"
       if (target && target !== "/student-dashboard") {
+        navigate(target);
+      }
+    }
+    else if (
+      userRole !== "intern" &&
+      location.pathname.startsWith("/intern-dashboard")
+    ) {
+      if (target && target !== "/intern-dashboard") {
         navigate(target);
       }
     }
@@ -185,7 +193,8 @@ const App = () => (
             <ScrollToTop />
             <BackNavigationHandler />
             <RoleRedirector />
-            <Routes>
+            <Suspense fallback={<PageLoader isVisible={true} />}>
+              <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/courses" element={<Courses />} />
               <Route path="/about" element={<About />} />
@@ -235,6 +244,26 @@ const App = () => (
                 }
               />
               <Route
+                path="/intern-dashboard"
+                element={
+                  <ProtectedRoute
+                    allowedRoles={["intern", "admin"]}
+                  >
+                    <InternDashboard />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/intern-dashboard/*"
+                element={
+                  <ProtectedRoute
+                    allowedRoles={["intern", "admin"]}
+                  >
+                    <InternDashboard />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
                 path="/instructor"
                 element={
                   <ProtectedRoute allowedRoles={["instructor", "admin"]}>
@@ -267,6 +296,14 @@ const App = () => (
                 }
               />
               <Route
+                path="/manager"
+                element={
+                  <ProtectedRoute allowedRoles={["manager", "admin"]}>
+                    <ManagerDashboard />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
                 path="/manager/*"
                 element={
                   <ProtectedRoute allowedRoles={["manager", "admin"]}>
@@ -285,6 +322,7 @@ const App = () => (
               />
               <Route path="*" element={<NotFound />} />
             </Routes>
+          </Suspense>
           </BrowserRouter>
         </TooltipProvider>
       </SocketProvider>
