@@ -1,8 +1,5 @@
-# Node.js LTS Debian Slim image
+# Node.js LTS Debian Slim image (Fewer network/DNS issues than Alpine on Windows Docker)
 FROM node:20-slim
-
-# Install Python3, GCC, G++ for native 100% offline fast execution
-RUN apt-get update && apt-get install -y python3 gcc g++ && rm -rf /var/lib/apt/lists/*
 
 # Set working directory inside container
 WORKDIR /app
@@ -10,7 +7,7 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install production dependencies
+# Install production dependencies with network optimizations
 RUN npm install --omit=dev --no-audit --no-fund
 
 # Copy application source code
