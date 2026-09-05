@@ -1,9 +1,115 @@
-export const API_URL =
-  import.meta.env.VITE_API_URL ||
-  (window.location.hostname === "localhost"
-    ? "http://localhost:5000/api"
-    : "https://aotms-lms-new.onrender.com/api");
+/**
+ * Normalizes the backend base URL so that it always points to the '/api' prefix,
+ * preventing 404 HTML responses that trigger "Unexpected token '<', <!DOCTYPE" syntax errors.
+ */
+const getBaseApiUrl = (): string => {
+  const envUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_RENDER_URL;
+  if (!envUrl) {
+    return "/api";
+  }
+  const trimmed = envUrl.trim().replace(/\/+$/, "");
+  return trimmed.endsWith("/api") ? trimmed : `${trimmed}/api`;
+};
 
+export const API_URL = getBaseApiUrl();
+
+/**
+ * Safely parse JSON responses from backend. If the backend returns an HTML page
+ * (e.g. 404 Not Found, 502 Bad Gateway during Render cold starts), this provides
+ * a descriptive Error instead of throwing SyntaxError: Unexpected token '<', <!DOCTYPE.
+ */
+export const parseJsonResponse = async <T = any>(res: Response): Promise<T> => {
+  const text = await res.text();
+  try {
+    return (text ? JSON.parse(text) : {}) as T;
+  } catch {
+    if (!res.ok) {
+      if (res.status === 404) {
+        throw new Error(`API endpoint not found (404) at ${res.url}. Please check the backend route.`);
+      }
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        throw new Error(
+          `Backend server is waking up or temporarily unavailable (${res.status}). Please retry in a few seconds.`
+        );
+      }
+      throw new Error(`Server returned error status ${res.status} (${res.statusText || 'Unknown'}).`);
+    }
+    throw new Error("Invalid response format received from server (expected JSON).");
+  }
+};
+
+// Shared promise for deduplicating concurrent refresh requests
+let refreshPromise: Promise<string> | null = null;
+
+/**
+ * Silently refresh the access token using the backend's HttpOnly refresh_token cookie.
+ * Deduplicates concurrent calls so only one refresh request is in flight at a time.
+ */
+export const refreshAccessToken = async (): Promise<string> => {
+  if (refreshPromise) {
+    return refreshPromise;
+  }
+
+  refreshPromise = (async () => {
+    try {
+      const res = await fetch(`${API_URL}/auth/refresh`, {
+        method: "POST",
+        credentials: "include", // Transmit HttpOnly cookie
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!res.ok) {
+        // If the refresh token is genuinely invalid or expired (401), session is dead
+        if (res.status === 401 || res.status === 403) {
+          localStorage.removeItem("access_token");
+          localStorage.removeItem("user");
+          localStorage.removeItem("user_role");
+          
+          // Only redirect if we are not already on an auth / public page
+          if (
+            typeof window !== "undefined" &&
+            !window.location.pathname.startsWith("/auth") &&
+            !window.location.pathname.startsWith("/login") &&
+            window.location.pathname !== "/"
+          ) {
+            window.location.href = "/auth";
+          }
+        }
+        throw new Error(`Session refresh failed with status ${res.status}`);
+      }
+
+      const data = await parseJsonResponse<any>(res);
+      const newAccessToken = data?.session?.access_token;
+      if (!newAccessToken) {
+        throw new Error("Invalid refresh response: access token missing");
+      }
+
+      localStorage.setItem("access_token", newAccessToken);
+
+      // Notify any listeners (e.g. useAuth hook or socket connections)
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("auth:token_refreshed", {
+            detail: { token: newAccessToken },
+          })
+        );
+      }
+
+      return newAccessToken;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+};
+
+/**
+ * Fetch wrapper that attaches the Bearer token and automatic credentials,
+ * transparently refreshing the token on 401 responses before retrying.
+ */
 export const fetchWithAuth = async <T = unknown>(
   url: string,
   options: RequestInit = {},
@@ -27,73 +133,54 @@ export const fetchWithAuth = async <T = unknown>(
     return h;
   };
 
-  let res = await fetch(`${API_URL}${url}`, {
-    ...options,
-    headers: getHeaders(token),
-  });
+  const endpoint = url.startsWith("http") ? url : `${API_URL}${url}`;
 
-  // Handle token expiration specifically - ONLY 401 should trigger refresh
+  let res: Response;
+  try {
+    res = await fetch(endpoint, {
+      ...options,
+      credentials: "include", // Always include cookies for cross-origin or same-site sessions
+      headers: getHeaders(token),
+    });
+  } catch (netErr) {
+    // Network errors (e.g. offline, connection drop) should NOT log the user out
+    throw netErr;
+  }
+
+  // Handle token expiration: attempt silent refresh once and retry
   if (res.status === 401) {
-    const refreshToken = localStorage.getItem("refresh_token");
-    if (refreshToken) {
-      try {
-        // Try to refresh the session locally via backend
-        const refreshRes = await fetch(`${API_URL}/auth/refresh`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refresh_token: refreshToken }),
-        });
+    try {
+      const newToken = await refreshAccessToken();
+      token = newToken;
 
-        if (refreshRes.ok) {
-          const data = await refreshRes.json();
-
-          // Save new tokens
-          token = data.session.access_token;
-          localStorage.setItem("access_token", token);
-          if (data.session.refresh_token) {
-            localStorage.setItem("refresh_token", data.session.refresh_token);
-          }
-
-          // Retry original request with fresh token
-          res = await fetch(`${API_URL}${url}`, {
-            ...options,
-            headers: getHeaders(token),
-          });
-        } else {
-          throw new Error("Refresh failed");
-        }
-      } catch (err) {
-        console.warn("Failed to refresh token automatically", err);
-        localStorage.clear();
-        window.location.href = "/auth";
-      }
-    } else {
-      console.warn("No refresh token found. Logging out legacy session.");
-      localStorage.clear();
-      window.location.href = "/auth";
+      // Retry the original request with the fresh token
+      res = await fetch(endpoint, {
+        ...options,
+        credentials: "include",
+        headers: getHeaders(token),
+      });
+    } catch (refreshErr) {
+      // If refresh failed because refresh token was rejected, an error is already handled
+      throw refreshErr;
     }
   }
 
   if (!res.ok) {
-    let errStr = "API Request Failed";
+    let errStr = `API Request Failed (${res.status})`;
     try {
-      const err = await res.json();
-      // Check for common error fields: 'error', 'message', or nested 'error.message'
+      const err = await parseJsonResponse<any>(res);
       errStr =
         err.error || err.message || (err.data && err.data.message) || errStr;
-    } catch {
-      // Ignore if response is not JSON
+    } catch (e: any) {
+      errStr = e.message || errStr;
     }
     throw new Error(errStr);
   }
 
-  return res.json();
-};
-
-export const parseJsonResponse = async (res: Response) => {
-  try {
-    return await res.json();
-  } catch {
-    return null;
+  // Support 204 No Content or empty responses
+  if (res.status === 204) {
+    return {} as T;
   }
+
+  return parseJsonResponse<T>(res);
 };
