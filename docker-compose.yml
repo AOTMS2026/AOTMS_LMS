@@ -1,13 +1,31 @@
 services:
-  # Backend Node.js Express + Socket.io service
+  # Backend Node.js service (Scalable)
   backend:
-    image: aotms_lms-1-backend:latest
     build:
       context: ./Backend
       dockerfile: Dockerfile
     ports:
-      - "80:5000"
-      - "5000:5000"
+      - "5000"
     env_file:
       - ./Backend/.env
     restart: always
+
+  # Frontend React SPA service
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+    restart: always
+
+  # NGINX Load Balancer (Routes traffic across frontend and scaled backend replicas)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: always
+
