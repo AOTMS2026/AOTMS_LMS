@@ -12,10 +12,6 @@ const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
 const cloudinary = require('cloudinary').v2;
 const vm = require('vm'); // Native Node.js module for executing code locally
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { execFile } = require('child_process');
 const pdfParse = require('pdf-parse');
 const FormData = require('form-data');
 const { sendEmail } = require('./utils/email');
@@ -902,91 +898,42 @@ Do not include any Markdown wrapper like \`\`\`json or text explanation around t
     }
 });
 
-// --- Local Native Python Execution Helper ---
-const runLocalPython = (code, stdin = '') => {
-    return new Promise((resolve) => {
-        const tmpDir = os.tmpdir();
-        const tmpFile = path.join(tmpDir, `script_${Date.now()}_${Math.floor(Math.random() * 10000)}.py`);
-        
-        fs.writeFile(tmpFile, code, 'utf8', (err) => {
-            if (err) {
-                return resolve({
-                    stdout: '',
-                    stderr: `Failed to write python script: ${err.message}`,
-                    code: 1,
-                    output: `Failed to write python script: ${err.message}`
-                });
-            }
-
-            const child = execFile('python3', [tmpFile], { timeout: 8000, maxBuffer: 5 * 1024 * 1024, encoding: 'utf8' }, (execErr, stdout, stderr) => {
-                fs.unlink(tmpFile, () => {});
-
-                if (execErr && execErr.killed) {
-                    return resolve({
-                        stdout: stdout || '',
-                        stderr: 'Time Limit Exceeded (8 seconds max runtime).',
-                        code: 1,
-                        output: (stdout || '') + '\nTime Limit Exceeded (8 seconds max runtime).'
-                    });
-                }
-
-                const outStr = stdout || '';
-                const errStr = stderr || (execErr && !stdout ? execErr.message : '');
-
-                resolve({
-                    stdout: outStr,
-                    stderr: errStr,
-                    code: execErr ? (execErr.code || 1) : 0,
-                    output: outStr || errStr || 'Execution completed.'
-                });
-            });
-
-            if (stdin && child.stdin) {
-                child.stdin.write(stdin);
-                child.stdin.end();
-            }
-        });
-    });
-};
-
-// --- Multi-Engine Code Execution Helper (Native Local + Judge0 Public CE) ---
+// --- Code Execution Helper ---
+// --- Code Execution Helper (Piston + Local VM Integration) ---
 const executeCode = async (language, sourceCode, stdin = '') => {
     const lang = language?.toLowerCase() || 'javascript';
 
-    // Normalization map
-    const langMap = {
-        'javascript': 'javascript', 'js': 'javascript', 'node': 'javascript',
-        'typescript': 'typescript', 'ts': 'typescript',
-        'python': 'python', 'python3': 'python', 'py': 'python',
+    // Map common frontend language names to Piston language identifiers
+    const pistonLangMap = {
+        'javascript': 'javascript',
+        'js': 'javascript',
+        'node': 'javascript',
+        'typescript': 'typescript',
+        'ts': 'typescript',
+        'python': 'python',
+        'python3': 'python',
+        'py': 'python',
         'java': 'java',
-        'cpp': 'cpp', 'c++': 'cpp', 'g++': 'cpp',
-        'c': 'c', 'gcc': 'c',
-        'csharp': 'csharp', 'c#': 'csharp',
-        'sql': 'sql', 'sqlite': 'sql', 'sqlite3': 'sql',
-        'go': 'go', 'golang': 'go',
-        'rust': 'rust', 'rs': 'rust',
+        'cpp': 'c++',
+        'c++': 'c++',
+        'c': 'c',
+        'csharp': 'csharp',
+        'c#': 'csharp',
+        'sql': 'sqlite3',
+        'sqlite': 'sqlite3',
+        'go': 'go',
+        'golang': 'go',
+        'rust': 'rust',
+        'rs': 'rust',
         'php': 'php',
-        'ruby': 'ruby', 'rb': 'ruby'
+        'ruby': 'ruby',
+        'rb': 'ruby'
     };
 
-    const targetLang = langMap[lang] || 'python';
+    const targetLang = pistonLangMap[lang] || lang;
 
-    // 1. Native Fast Python Execution (0ms network latency, supports emojis, long scripts & loops)
-    if (targetLang === 'python') {
-        try {
-            console.log('[Native Engine] Running Python code locally via child_process...');
-            const res = await runLocalPython(sourceCode, stdin);
-            if (res.stdout || (res.code === 0 && !res.stderr.includes('python3: not found'))) {
-                return { run: res, language: 'python' };
-            }
-            console.log('[Native Python] Local python3 not installed in environment, trying cloud compiler...');
-        } catch (pyErr) {
-            console.warn('[Native Python Error]:', pyErr.message, 'Falling back to cloud API...');
-        }
-    }
-
-    // 2. Fast Local JS Execution
-    if (targetLang === 'javascript' && !stdin) {
+    // 1. Local JS VM execution for super fast simple JS scripts
+    if ((lang === 'javascript' || lang === 'js') && !stdin) {
         try {
             const outputBuffer = [];
             const errorBuffer = [];
@@ -1001,7 +948,7 @@ const executeCode = async (language, sourceCode, stdin = '') => {
             };
             const script = new vm.Script(sourceCode);
             const context = vm.createContext(sandbox);
-            script.runInContext(context, { timeout: 4000 });
+            script.runInContext(context, { timeout: 3000 });
             return {
                 run: {
                     stdout: outputBuffer.join('\n'),
@@ -1012,51 +959,42 @@ const executeCode = async (language, sourceCode, stdin = '') => {
                 language: 'javascript'
             };
         } catch (err) {
-            console.log('[Local JS VM] Falling through to cloud compilers due to:', err.message);
+            // Fall through to Piston if local VM script fails or syntax complex
+            console.log('[Local VM JS] Falling back to Piston due to:', err.message);
         }
     }
 
-    // 3. Judge0 Public CE API (No API Key Required)
+    // 2. Piston Engine Execution (Free, Open-Source, Supports 50+ languages)
     try {
-        console.log(`[Judge0 Public CE] Compiling ${targetLang} code...`);
-        const judge0LangMap = {
-            'python': 71,
-            'javascript': 63,
-            'typescript': 74,
-            'cpp': 54,
-            'c': 50,
-            'java': 62,
-            'csharp': 51,
-            'sql': 82,
-            'go': 60,
-            'rust': 73,
-            'php': 68,
-            'ruby': 72
-        };
-        const langId = judge0LangMap[targetLang] || 71;
-
-        const judge0Res = await axios.post('https://ce.judge0.com/submissions?wait=true', {
-            source_code: sourceCode,
-            language_id: langId,
+        console.log(`[Piston Engine] Submitting ${targetLang} code execution request...`);
+        const pistonRes = await axios.post('https://emkc.org/api/v2/piston/execute', {
+            language: targetLang,
+            version: '*',
+            files: [
+                {
+                    content: sourceCode
+                }
+            ],
             stdin: stdin || ''
-        }, { timeout: 10000 });
+        }, {
+            timeout: 10000
+        });
 
-        const { stdout, stderr, compile_output, message, status } = judge0Res.data;
-        const outStr = stdout || '';
-        const errStr = stderr || compile_output || message || '';
+        const { run } = pistonRes.data;
 
         return {
             run: {
-                stdout: outStr,
-                stderr: errStr,
-                code: status?.id === 3 ? 0 : 1,
-                output: outStr || errStr || 'Execution finished.'
+                stdout: run.stdout || '',
+                stderr: run.stderr || run.output && run.code !== 0 ? run.output : '',
+                code: run.code ?? 0,
+                output: run.output || run.stdout || run.stderr || '',
+                signal: run.signal
             },
             language: targetLang
         };
-    } catch (j0Err) {
-        console.error('[Judge0 Public CE Error]:', j0Err.message);
-        throw new Error(`Code execution failed: ${j0Err.message}`);
+    } catch (pistonErr) {
+        console.error('[Piston Execution Error]:', pistonErr.response?.data || pistonErr.message);
+        throw new Error(`Code execution failed: ${pistonErr.response?.data?.message || pistonErr.message}`);
     }
 };
 
@@ -1081,58 +1019,6 @@ app.post('/api/run-code', authenticateToken, async (req, res) => {
 
 // --- Auth Routes ---
 
-// Helper to trigger n8n OTP Webhook with automatic Test/Prod URL fallback
-const triggerOtpWebhook = async ({ email, full_name, otp }) => {
-    let n8nUrl = (process.env.OTP_N8N_URL || process.env.OTP_N8n || process.env.OTP_N8N || 'https://aotms.app.n8n.cloud/webhook-test/Email').trim();
-    console.log(`[AUTH-OTP Webhook] Triggering n8n at ${n8nUrl} for ${email}...`);
-
-    try {
-        const response = await axios.post(n8nUrl, {
-            email,
-            full_name: full_name || 'Student',
-            otp
-        }, { timeout: 8000 });
-        console.log(`[AUTH-OTP Webhook] Successfully delivered OTP via n8n for ${email}:`, response.data);
-        return true;
-    } catch (err) {
-        // Automatically try swapping between test URL (/webhook-test/) and prod URL (/webhook/)
-        const altUrl = n8nUrl.includes('/webhook-test/') 
-            ? n8nUrl.replace('/webhook-test/', '/webhook/')
-            : n8nUrl.replace('/webhook/', '/webhook-test/');
-
-        console.warn(`[AUTH-OTP Webhook Primary Failed: ${err.message}]. Retrying with fallback URL: ${altUrl}...`);
-        try {
-            const altResponse = await axios.post(altUrl, {
-                email,
-                full_name: full_name || 'Student',
-                otp
-            }, { timeout: 8000 });
-            console.log(`[AUTH-OTP Webhook Fallback] Successfully delivered OTP via n8n (${altUrl}) for ${email}:`, altResponse.data);
-            return true;
-        } catch (fallbackErr) {
-            console.error(`[AUTH-OTP Webhook Error]: n8n Webhook failed (${err.message} / ${fallbackErr.message}).`);
-            
-            // ── Brevo SMTP Fallback Disabled (Uncomment below to re-enable Brevo SMTP if needed) ──
-            /*
-            const otpHtml = `
-                <div style="font-family: 'Outfit', 'Inter', sans-serif; max-width: 500px; margin: 0 auto; padding: 24px; border-radius: 16px; background: #ffffff; border: 1px solid #e2e8f0;">
-                    <h2 style="color: #0f172a;">Academy of Tech Masters</h2>
-                    <p>Hello ${full_name || 'Student'}, your verification OTP code is:</p>
-                    <div style="background: #f8fafc; font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #1e3a8a; text-align: center; padding: 16px; border-radius: 12px; margin: 20px 0;">${otp}</div>
-                    <p style="font-size: 12px; color: #64748b;">This OTP is valid for 5 minutes.</p>
-                </div>
-            `;
-            await sendEmail({
-                to: email,
-                subject: `🎉 Email Verification OTP: ${otp} | Academy of Tech Masters`,
-                html: otpHtml
-            });
-            */
-            return false;
-        }
-    }
-};
-
 app.post('/api/auth/send-otp', async (req, res) => {
     const { email, full_name } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
@@ -1156,10 +1042,33 @@ app.post('/api/auth/send-otp', async (req, res) => {
             { upsert: true, returnDocument: 'after' }
         );
 
-        console.log(`[AUTH-OTP] Generated OTP for ${email}: ${otp}`);
+        console.log(`[AUTH-OTP] OTP for ${email}: ${otp}`);
 
-        // Trigger n8n Webhook for OTP Email
-        await triggerOtpWebhook({ email, full_name, otp });
+        // Send OTP email directly via SMTP
+        const otpHtml = `
+            <div style="font-family: 'Outfit', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #334155; max-width: 500px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);">
+                <div style="text-align: center; margin-bottom: 24px;">
+                    <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); width: 56px; height: 56px; border-radius: 14px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 12px; color: #ffffff; font-size: 20px; font-weight: 800; line-height: 56px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-left: auto; margin-right: auto;">A</div>
+                    <h2 style="color: #0f172a; margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.02em;">Academy of Tech Masters</h2>
+                    <p style="color: #ea580c; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin: 4px 0 0 0;">One-Time verification code</p>
+                </div>
+                <p style="font-size: 15px; color: #334155; margin-top: 0; font-weight: 600;">Dear ${full_name || 'Student'},</p>
+                <p style="font-size: 14px; color: #475569;">To complete your login or registration on the AOTMS portal, please enter the following verification code. This code is valid for 10 minutes:</p>
+                <div style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 12px; text-align: center; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #1e3a8a; padding: 18px; margin: 24px 0; text-shadow: 0 1px 1px rgba(0,0,0,0.05); font-family: monospace;">
+                    ${otp}
+                </div>
+                <p style="font-size: 12px; color: #64748b; margin-bottom: 0; border-top: 1px solid #f1f5f9; padding-top: 16px;">If you did not make this request, you do not need to take any action. Your account remains secure.</p>
+                <div style="margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 16px; text-align: center;">
+                    <p style="font-size: 11px; color: #94a3b8; margin: 0 0 4px 0;">Academy of Tech Masters Learning Management System.</p>
+                    <p style="font-size: 11px; color: #94a3b8; margin: 0;">&copy; ${new Date().getFullYear()} <a href="https://aotms.com" style="color: #3b82f6; text-decoration: none; font-weight: 600;">aotms.com</a>. All rights reserved.</p>
+                </div>
+            </div>
+        `;
+        await sendEmail({
+            to: email,
+            subject: 'Verify Your Email | Academy of Tech Masters',
+            html: otpHtml
+        });
 
         res.json({ message: 'OTP sent successfully' });
     } catch (err) {
@@ -1168,6 +1077,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
 });
 
 app.post('/api/auth/resend-otp', async (req, res) => {
+    // Reuse logic, maybe separate if needed differently
     const { email, full_name } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
@@ -1191,8 +1101,31 @@ app.post('/api/auth/resend-otp', async (req, res) => {
         );
         console.log(`[AUTH-OTP] Resent OTP for ${email}: ${otp}`);
 
-        // Trigger n8n Webhook for OTP Email
-        await triggerOtpWebhook({ email, full_name, otp });
+        // Send OTP email directly via SMTP
+        const otpHtml = `
+            <div style="font-family: 'Outfit', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #334155; max-width: 500px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);">
+                <div style="text-align: center; margin-bottom: 24px;">
+                    <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); width: 56px; height: 56px; border-radius: 14px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 12px; color: #ffffff; font-size: 20px; font-weight: 800; line-height: 56px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-left: auto; margin-right: auto;">A</div>
+                    <h2 style="color: #0f172a; margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.02em;">Academy of Tech Masters</h2>
+                    <p style="color: #ea580c; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin: 4px 0 0 0;">One-Time verification code</p>
+                </div>
+                <p style="font-size: 15px; color: #334155; margin-top: 0; font-weight: 600;">Dear ${full_name || 'Student'},</p>
+                <p style="font-size: 14px; color: #475569;">To complete your login or registration on the AOTMS portal, please enter the following verification code. This code is valid for 10 minutes:</p>
+                <div style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 12px; text-align: center; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #1e3a8a; padding: 18px; margin: 24px 0; text-shadow: 0 1px 1px rgba(0,0,0,0.05); font-family: monospace;">
+                    ${otp}
+                </div>
+                <p style="font-size: 12px; color: #64748b; margin-bottom: 0; border-top: 1px solid #f1f5f9; padding-top: 16px;">If you did not make this request, you do not need to take any action. Your account remains secure.</p>
+                <div style="margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 16px; text-align: center;">
+                    <p style="font-size: 11px; color: #94a3b8; margin: 0 0 4px 0;">Academy of Tech Masters Learning Management System.</p>
+                    <p style="font-size: 11px; color: #94a3b8; margin: 0;">&copy; ${new Date().getFullYear()} <a href="https://aotms.com" style="color: #3b82f6; text-decoration: none; font-weight: 600;">aotms.com</a>. All rights reserved.</p>
+                </div>
+            </div>
+        `;
+        await sendEmail({
+            to: email,
+            subject: 'Verify Your Email | Academy of Tech Masters',
+            html: otpHtml
+        });
 
         res.json({ message: 'OTP resent successfully' });
     } catch (err) {
@@ -1661,10 +1594,14 @@ app.post('/api/auth/login', async (req, res) => {
             `;
 
             try {
-                await triggerOtpWebhook({ email, full_name: user.full_name, otp });
-                console.log(`[Security] Admin OTP sent successfully via n8n to ${email}`);
+                await sendEmail({
+                    to: email,
+                    subject: 'Security: Admin Login Passcode | Academy of Tech Masters',
+                    html: otpHtml
+                });
+                console.log(`[Security] Admin OTP sent successfully to ${email}`);
             } catch (e) {
-                console.error(`[Security] Admin OTP API error:`, e.message);
+                console.error(`[Security] Admin OTP Resend API error:`, e.message);
             }
 
             console.log(`[Security] Admin OTP generated and scheduled for ${email}: ${otp}`);
@@ -1836,8 +1773,12 @@ app.post('/api/auth/admin-resend-otp', async (req, res) => {
         `;
 
         try {
-            await triggerOtpWebhook({ email, full_name: user.full_name, otp });
-            console.log(`[Security] Admin OTP resent successfully via n8n to ${email}`);
+            await sendEmail({
+                to: email,
+                subject: 'Security: Admin Login Passcode | Academy of Tech Masters',
+                html: otpHtml
+            });
+            console.log(`[Security] Admin OTP resent successfully to ${email}`);
         } catch (e) {
             console.error(`[Security] Admin OTP Resend API error (Resend):`, e.message);
         }
@@ -5104,35 +5045,28 @@ app.get('/api/student/accessible-exams', authenticateToken, async (req, res) => 
             return false;
         };
 
-        // 3. Get implicitly accessible exams (live/scheduled) and mocks via enrolled courses ONLY
-        const courseExams = (enrolledCourseIds && enrolledCourseIds.length > 0) 
-            ? await Exam.find({
-                course_id: { $in: enrolledCourseIds },
-                approval_status: 'approved',
-                status: 'active'
-            }).lean()
-            : [];
+        // 3. Get implicitly accessible exams (live/scheduled) and mocks via courses
+        const courseExams = await Exam.find({
+            course_id: { $in: enrolledCourseIds },
+            approval_status: 'approved',
+            status: 'active'
+        }).lean();
 
-        // 4. Identify explicitly granted question bank topics
+        // 4. Identify all accessible topics (implicit from courses + explicit granted)
         const explicitQBTopics = explicitAccess
             .filter(a => a.access_type === 'question_bank' && a.question_bank_topic)
             .map(a => a.question_bank_topic);
 
-        // 5. Build the list of Question Banks (qbs) strictly for enrolled courses or explicitly granted topics
+        // 5. Build the list of Question Banks (qbs)
         const normalizedTopics = explicitQBTopics.map(t => t.trim());
-        const qbConditions = [];
-        if (enrolledCourseIds && enrolledCourseIds.length > 0) {
-            qbConditions.push({ course_id: { $in: enrolledCourseIds } });
-        }
-        if (normalizedTopics.length > 0) {
-            qbConditions.push({ topic: { $in: normalizedTopics } });
-            qbConditions.push({ topic: { $in: explicitQBTopics } });
-        }
-
-        const qbs = qbConditions.length > 0 
-            ? await QuestionBank.find({ $or: qbConditions }).lean()
-            : [];
-        console.log(`[ACL] Found ${qbs.length} matching Question Banks for student ${studentId}.`);
+        const qbs = await QuestionBank.find({
+            $or: [
+                { course_id: { $in: enrolledCourseIds }, approval_status: 'approved' },
+                { topic: { $in: normalizedTopics }, approval_status: 'approved' },
+                { topic: { $in: explicitQBTopics }, approval_status: 'approved' }
+            ]
+        }).lean();
+        console.log(`[ACL] Found ${qbs.length} matching Question Banks.`);
 
         // 5.5. Find matching exam images and metadata for these topics to show as posters
         const qbTopics = [...new Set([...qbs.map(qb => qb.topic), ...normalizedTopics])];
@@ -5308,13 +5242,10 @@ app.get('/api/student/exam-questions/:id', authenticateToken, async (req, res) =
         const isImplicit = id.startsWith('implicit_');
 
         if (isQB) {
-            const topic = id.replace('qb_', '').trim();
-            const escapedTopic = topic.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const topic = id.replace('qb_', '');
             questions = await QuestionBank.find({
-                $or: [
-                    { topic: { $regex: new RegExp(escapedTopic, "i") } },
-                    { course_id: mongoose.Types.ObjectId.isValid(topic) ? topic : null }
-                ]
+                topic,
+                approval_status: 'approved'
             }).lean();
         } else {
             const cleanId = id.replace('implicit_', '').trim();
@@ -5334,28 +5265,22 @@ app.get('/api/student/exam-questions/:id', authenticateToken, async (req, res) =
                     : null;
 
                 if (exam) {
-                    // Fetch STRICTLY by topics array, exam title, or exam_id
+                    // Fetch by topics array OR by exam title (Sync Fallback)
                     const searchTopics = (exam.topics && exam.topics.length > 0)
                         ? exam.topics
                         : [exam.title];
 
-                    const topicRegexes = searchTopics.map(t => new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
-
                     questions = await QuestionBank.find({
-                        $or: [
-                            { topic: { $in: topicRegexes } },
-                            { topic: { $in: searchTopics } },
-                            { exam_id: exam._id },
-                            { exam_id: exam._id.toString() }
-                        ]
+                        topic: { $in: searchTopics },
+                        approval_status: 'approved'
                     })
-                    .limit(exam.total_questions || 50)
-                    .lean();
-                } else {
-                    // Try cleanId as a direct topic name
-                    const escapedId = cleanId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        .limit(exam.total_questions || 50)
+                        .lean();
+                } else if (isImplicit) {
+                    // If we still didn't find it but it's marked implicit, it might be a QB topic that leaked through
                     questions = await QuestionBank.find({
-                        topic: { $regex: new RegExp(escapedId, "i") }
+                        topic: cleanId,
+                        approval_status: 'approved'
                     }).lean();
                 }
             }
@@ -5368,24 +5293,8 @@ app.get('/api/student/exam-questions/:id', authenticateToken, async (req, res) =
         const data = questions.map(q => ({
             id: q._id,
             text: q.question_text,
-            question_text: q.question_text,
             type: q.type,
-            question_type: q.type,
-            language: q.language || 'python',
-            difficulty: q.difficulty || 'medium',
-            input_format: q.input_format,
-            output_format: q.output_format,
-            explanation: q.explanation,
-            constraints: q.constraints,
-            sample_input: q.sample_input,
-            sample_output: q.sample_output,
-            test_cases: (q.test_cases || []).map(tc => ({
-                input: tc.input,
-                expected_output: tc.expected_output,
-                explanation: tc.explanation,
-                is_hidden: tc.is_hidden
-            })),
-            options: (q.options || []).map(opt => ({ id: opt._id || Math.random(), text: typeof opt === 'string' ? opt : opt.text })),
+            options: q.options.map(opt => ({ id: opt._id || Math.random(), text: opt.text })),
             // Do NOT send is_correct to frontend during exam
             marks: q.marks || 1
         }));
@@ -8562,11 +8471,4 @@ httpServer.listen(port, () => {
     console.log(`[System] Auto-restart triggered at ${new Date().toISOString()}`);
 });
 
-// ── Global Process Safety Handlers (Prevents Server Crashes) ──
-process.on('uncaughtException', (err) => {
-    console.error('[CRITICAL] Uncaught Exception caught to prevent crash:', err);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('[CRITICAL] Unhandled Promise Rejection caught to prevent crash:', reason);
-});
+// Trigger nodemon restart
