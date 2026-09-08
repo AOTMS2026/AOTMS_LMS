@@ -12,8 +12,13 @@ const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
 const cloudinary = require('cloudinary').v2;
 const vm = require('vm'); // Native Node.js module for executing code locally
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execFile } = require('child_process');
 const pdfParse = require('pdf-parse');
 const FormData = require('form-data');
+const { sendEmail } = require('./utils/email');
 
 // Cloudinary Config
 cloudinary.config({
@@ -259,8 +264,73 @@ const generateToken = (user) => {
             email: user.email,
         },
         JWT_SECRET,
+        { expiresIn: '30m' }
+    );
+};
+
+const generateRefreshToken = (user) => {
+    return jwt.sign(
+        {
+            id: user._id,
+            email: user.email,
+        },
+        JWT_SECRET,
         { expiresIn: '7d' }
     );
+};
+
+const getCookie = (req, name) => {
+    const matches = req.headers.cookie && req.headers.cookie.match(new RegExp(
+        "(?:^|; )" + name.replace(/([\.$?*|{}\(\)\[\]\\\/\+^])/g, '\\$1') + "=([^;]*)"
+    ));
+    return matches ? decodeURIComponent(matches[1]) : undefined;
+};
+
+const getRefreshTokenCookieOptions = () => ({
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+});
+
+const getClearRefreshTokenCookieOptions = () => ({
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    path: '/'
+});
+
+const isPasswordStrong = (password) => {
+    if (!password) return false;
+    if (password.length < 8) return false;
+    const hasUppercase = /[A-Z]/.test(password);
+    const hasLowercase = /[a-z]/.test(password);
+    const hasNumber = /[0-9]/.test(password);
+    const hasSpecial = /[^A-Za-z0-9]/.test(password);
+    return hasUppercase && hasLowercase && hasNumber && hasSpecial;
+};
+
+const verifyRecaptcha = async (token) => {
+    if (process.env.NODE_ENV !== 'production' && !token) {
+        return true;
+    }
+    const secret = process.env.RECAPTCHA_SECRET_KEY;
+    if (!secret) return true;
+    if (!token) return false;
+
+    try {
+        const response = await fetch(`https://www.google.com/recaptcha/api/siteverify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ secret, response: token })
+        });
+        const data = await response.json();
+        return data.success;
+    } catch (err) {
+        console.error('ReCAPTCHA verify error:', err.message);
+        return false;
+    }
 };
 
 const authenticateToken = async (req, res, next) => {
@@ -352,35 +422,112 @@ const requireInstructor = requireRole(['admin', 'manager', 'instructor']);
 app.post('/api/admin/broadcast', authenticateToken, requireAdminOrManager, async (req, res) => {
     try {
         const { type, selectedUsers, category, subject, message } = req.body;
-        console.log('[AI Hub Broadcast] Hit for', selectedUsers?.length, 'users');
+        console.log('[AI Hub Broadcast] Hit for', selectedUsers?.length, 'users', selectedUsers);
 
         if (!selectedUsers || selectedUsers.length === 0) {
             return res.status(400).json({ error: 'No recipients selected' });
         }
 
-        const recipients = await Profile.find({ user_id: { $in: selectedUsers } }).lean();
-        const emails = recipients.map(p => p.email).filter(e => !!e);
-
-        if (emails.length === 0) {
-            return res.status(400).json({ error: 'No valid emails found for selected users' });
+        if (!subject || !message) {
+            return res.status(400).json({ error: 'Subject and message are required' });
         }
 
-        const n8nWebhookUrl = process.env.N8N_ADMIN_STUDENT_EMAIL_URL || process.env.N8N_EMAIL_WEBHOOK_URL;
-        if (n8nWebhookUrl) {
-            console.log(`[AI Hub Broadcast] Proxying to n8n: ${n8nWebhookUrl}`);
-            await axios.post(n8nWebhookUrl, {
-                broadcast_type: type,
-                category,
-                subject,
-                content: message,
-                recipients: emails,
-                admin_id: req.user.id,
-                timestamp: new Date().toISOString()
+        // ✅ FIX: Convert string IDs to ObjectId so MongoDB $in query actually matches
+        const validObjectIds = selectedUsers
+            .filter(id => mongoose.Types.ObjectId.isValid(id))
+            .map(id => new mongoose.Types.ObjectId(id));
+
+        if (validObjectIds.length === 0) {
+            console.error('[AI Hub Broadcast] No valid ObjectIds from selectedUsers:', selectedUsers);
+            return res.status(400).json({ error: 'No valid user IDs provided' });
+        }
+
+        // Fetch emails + names from User collection (authoritative source)
+        const users = await User.find({ _id: { $in: validObjectIds } }).select('email full_name').lean();
+        console.log('[AI Hub Broadcast] Users found from DB:', users.length, users.map(u => u.email));
+
+        const userMap = {};
+        users.forEach(u => {
+            if (u.email) userMap[u._id.toString()] = { email: u.email, full_name: u.full_name || 'Student' };
+        });
+
+        // Fallback: check Profile for any missing (also cast to ObjectId)
+        const missingIds = selectedUsers.filter(id => !userMap[id] && mongoose.Types.ObjectId.isValid(id))
+            .map(id => new mongoose.Types.ObjectId(id));
+        if (missingIds.length > 0) {
+            console.log('[AI Hub Broadcast] Checking profiles for missing IDs:', missingIds.length);
+            const profiles = await Profile.find({ user_id: { $in: missingIds } }).lean();
+            profiles.forEach(p => {
+                if (p.email) userMap[p.user_id.toString()] = { email: p.email, full_name: p.full_name || 'Student' };
             });
-            console.log('[AI Hub Broadcast] n8n response received successfully');
         }
 
-        res.json({ success: true, message: `Broadcast initiated for ${emails.length} recipients.` });
+        const recipients = Object.entries(userMap).map(([uid, u]) => ({ user_id: uid, ...u }));
+        console.log('[AI Hub Broadcast] Resolved recipients:', recipients.map(r => r.email));
+
+        if (recipients.length === 0) {
+            return res.status(400).json({ error: 'No valid emails found for selected users. Please sync platform data and try again.' });
+        }
+
+        console.log('[AI Hub Broadcast] Sending direct emails to', recipients.length, 'recipients');
+
+        const results = await Promise.allSettled(
+            recipients.map(r => {
+                const html = `
+                    <div style="font-family: 'Outfit', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #334155; max-width: 600px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);">
+                        <div style="text-align: center; margin-bottom: 28px;">
+                            <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); width: 64px; height: 64px; border-radius: 16px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 16px; color: #ffffff; font-size: 24px; font-weight: 800; line-height: 64px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-left: auto; margin-right: auto;">A</div>
+                            <h2 style="color: #0f172a; margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -0.03em;">Academy of Tech Masters</h2>
+                            <p style="color: #64748b; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; margin: 4px 0 0 0;">Official Broadcast Notification</p>
+                        </div>
+                        <div style="background-color: #f8fafc; border-radius: 16px; padding: 24px; border: 1px solid #f1f5f9; margin-bottom: 24px;">
+                            <p style="font-size: 16px; font-weight: 700; color: #1e293b; margin-top: 0; margin-bottom: 12px;">Hello ${r.full_name || 'Student'},</p>
+                            <div style="font-size: 15px; color: #334155; white-space: pre-wrap; line-height: 1.7;">${message}</div>
+                        </div>
+                        <div style="text-align: center; margin: 28px 0;">
+                            <a href="https://aotms.com" style="background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%); color: #ffffff; padding: 14px 32px; text-decoration: none; font-weight: 700; font-size: 14px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);">Visit LMS Dashboard</a>
+                        </div>
+                        <div style="margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 20px; text-align: center;">
+                            <p style="font-size: 12px; color: #94a3b8; margin: 0 0 6px 0;">This email is an official request sent to registered system members of AOTMS LMS.</p>
+                            <p style="font-size: 12px; color: #94a3b8; margin: 0;">&copy; ${new Date().getFullYear()} <a href="https://aotms.com" style="color: #3b82f6; text-decoration: none; font-weight: 600;">aotms.com</a>. All rights reserved.</p>
+                        </div>
+                    </div>
+                `;
+                return sendEmail({
+                    to: r.email,
+                    subject: subject,
+                    html: html
+                });
+            })
+        );
+
+        const succeeded = results.filter(r => r.status === 'fulfilled').length;
+        const failed = results.filter(r => r.status === 'rejected').length;
+        results.forEach((r, i) => {
+            if (r.status === 'rejected') {
+                console.error(`[AI Hub Broadcast] ❌ Failed for ${recipients[i]?.email}:`, r.reason?.message);
+            } else {
+                console.log(`[AI Hub Broadcast] ✅ Sent to ${recipients[i]?.email}`);
+            }
+        });
+
+        console.log(`[AI Hub Broadcast] Done — ${succeeded} sent, ${failed} failed out of ${recipients.length} total`);
+
+        if (succeeded === 0 && failed > 0) {
+            return res.status(502).json({
+                success: false,
+                error: `Mail broadcast failed. Check SMTP credentials in .env file.`,
+                failed,
+                succeeded
+            });
+        }
+
+        res.json({
+            success: true,
+            message: `Broadcast sent to ${succeeded} recipient${succeeded !== 1 ? 's' : ''}.${failed > 0 ? ` ${failed} failed.` : ''}`,
+            succeeded,
+            failed
+        });
     } catch (err) {
         handleError(res, err, 'ai-broadcast-proxy');
     }
@@ -602,68 +749,207 @@ app.post('/api/manager/generate-questions', authenticateToken, requireInstructor
     console.log('[API] Generate Questions Request:', req.body.topic, req.body.type);
     const { topic, type, count, difficulty, prompt } = req.body;
 
-    // Determine webhook URL based on type
-    const N8N_MCQ_WEBHOOK = process.env.N8N_MCQ_GENERATOR_URL || 'https://aotms.app.n8n.cloud/webhook/generate-quiz';
-    const N8N_TRUE_FALSE_WEBHOOK = process.env.N8N_TRUE_FALSE_GENERATOR_URL || 'https://aotms.app.n8n.cloud/webhook/true';
-    const N8N_SHORT_ANSWER_WEBHOOK = process.env.N8N_SHORT_ANSWER_GENERATOR_URL || 'https://aotms.app.n8n.cloud/webhook/generate-short-answer';
-    const N8N_LONG_ANSWER_WEBHOOK = process.env.N8N_LONG_ANSWER_GENERATOR_URL || 'https://aotms.app.n8n.cloud/webhook/generate-long-answer';
-    const N8N_FILL_BLANK_WEBHOOK = process.env.N8N_FILL_BLANK_GENERATOR_URL || 'https://aotms.app.n8n.cloud/webhook/generate-fill-blank';
-    const N8N_CODING_WEBHOOK = process.env.N8N_CODING_GENERATOR_URL || 'https://aotms.app.n8n.cloud/webhook/generate-coding';
+    const aiAgentApiKey = (process.env.AI_AGENT_API || '').trim();
 
-    let webhookUrl;
-    switch (type) {
-        case 'mcq':
-            webhookUrl = N8N_MCQ_WEBHOOK;
-            break;
-        case 'true_false':
-            webhookUrl = N8N_TRUE_FALSE_WEBHOOK;
-            break;
-        case 'short':
-        case 'short_answer':
-            webhookUrl = N8N_SHORT_ANSWER_WEBHOOK;
-            break;
-        case 'long':
-        case 'long_answer':
-            webhookUrl = N8N_LONG_ANSWER_WEBHOOK;
-            break;
-        case 'fill_blank':
-            webhookUrl = N8N_FILL_BLANK_WEBHOOK;
-            break;
-        case 'coding':
-            webhookUrl = N8N_CODING_WEBHOOK;
-            break;
-        default:
-            webhookUrl = N8N_MCQ_WEBHOOK; // Default fallback
+    const buildMockQuestion = (qType, qTopic, qDifficulty) => {
+        const shortType = qType?.toLowerCase();
+        if (shortType === 'true_false') {
+            return {
+                topic: qTopic || "General",
+                question_text: "Is the server correctly running?",
+                type: "true_false",
+                difficulty: qDifficulty || "medium",
+                options: ["True", "False"],
+                correct_answer: "True",
+                explanation: "This is a simple explanation.",
+                marks: 1
+            };
+        }
+        if (shortType === 'short' || shortType === 'short_answer') {
+            return {
+                topic: qTopic || "General",
+                question_text: "State the primary method to authenticate API key.",
+                type: "short_answer",
+                difficulty: qDifficulty || "medium",
+                correct_answer: "Process API key headers.",
+                explanation: "This is a simple explanation.",
+                marks: 1
+            };
+        }
+        if (shortType === 'long' || shortType === 'long_answer') {
+            return {
+                topic: qTopic || "General",
+                question_text: "Explain the concept of API routing.",
+                type: "long_answer",
+                difficulty: qDifficulty || "medium",
+                correct_answer: "API routing processes requests dynamically through express routes.",
+                explanation: "This is a simple explanation.",
+                marks: 5
+            };
+        }
+        if (shortType === 'fill_blank') {
+            return {
+                topic: qTopic || "General",
+                question_text: "AOTMS uses _______ for databases.",
+                type: "fill_blank",
+                difficulty: qDifficulty || "medium",
+                correct_answer: "MongoDB",
+                explanation: "This is a simple explanation.",
+                marks: 1
+            };
+        }
+        if (shortType === 'coding') {
+            return {
+                topic: qTopic || "General",
+                question_text: "Write code to log 'Hello World'.",
+                type: "coding",
+                difficulty: qDifficulty || "medium",
+                correct_answer: "console.log('Hello World');",
+                explanation: "This is a simple explanation.",
+                marks: 5
+            };
+        }
+        // Default MCQ
+        return {
+            topic: qTopic || "General",
+            question_text: "Which protocol is standard for web traffic?",
+            type: "mcq",
+            difficulty: qDifficulty || "medium",
+            options: ["HTTP", "FTP", "SMTP", "SSH"],
+            correct_answer: "HTTP",
+            explanation: "This is a simple explanation.",
+            marks: 1
+        };
+    };
+
+    if (!aiAgentApiKey) {
+        console.warn('[AI_AGENT_API] Key is missing in .env. Returning local mock questions.');
+        const mockQ = buildMockQuestion(type, topic, difficulty);
+        return res.json({
+            testing_msg: "testing HI message Received an Output",
+            ai_agent_api: "none",
+            questions: [mockQ]
+        });
     }
 
     try {
-        const response = await axios.post(webhookUrl, {
-            topic,
-            context: topic, // Alias for older n8n workflows
-            type,
-            question_type: type, // Alias
-            count,
-            questionCount: count, // Alias
-            difficulty,
-            prompt,
-            timestamp: new Date().toISOString()
-        }, { timeout: 120000 }); // AI generation can be slow
+        console.log(`[AI_AGENT_API Trigger] Calling OpenAI chat/completions using Project Key...`);
+        console.log("testing HI message Received an Output.");
 
-        // Forward the response data directly
-        res.json(response.data);
-    } catch (error) {
-        console.error('Error calling n8n webhook:', error.message);
-        if (error.response) {
-            res.status(error.response.status).json(error.response.data);
-        } else {
-            res.status(500).json({ error: 'Failed to generate questions via AI service' });
+        const systemPrompt = `You are an expert quiz generator. Generate exactly ${count || 1} questions of type '${type || 'mcq'}' on the topic '${topic || 'General'}' with a difficulty level of '${difficulty || 'medium'}'.
+Extra instructions: ${prompt || 'None'}.
+
+You MUST reply with a JSON object in this exact schema:
+{
+  "questions": [
+    {
+      "topic": "${topic || 'General'}",
+      "question_text": "Question text here",
+      "type": "${type || 'mcq'}",
+      "difficulty": "${difficulty || 'medium'}",
+      "options": ["Option A", "Option B", "Option C", "Option D"], // ONLY include for mcq or true_false (options should be ["True", "False"] for true_false)
+      "correct_answer": "Option text of the correct answer, or True/False, or text containing the exact correct answer/code",
+      "explanation": "Simple explanation describing why this answer is correct",
+      "marks": 1
+    }
+  ]
+}
+Do not include any Markdown wrapper like \`\`\`json or text explanation around the JSON, just a clean JSON output.`;
+
+        const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+            model: 'gpt-4o-mini',
+            messages: [
+                { role: 'user', content: systemPrompt }
+            ],
+            temperature: 0.7,
+            response_format: { type: 'json_object' }
+        }, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${aiAgentApiKey}`
+            },
+            timeout: 60000
+        });
+
+        const content = response.data.choices[0].message.content;
+        let data = JSON.parse(content);
+
+        if (data && typeof data === 'object') {
+            if (Array.isArray(data)) {
+                data = { questions: data };
+            }
+            data.testing_msg = "testing HI message Received an Output";
+            data.ai_agent_api = aiAgentApiKey;
         }
+
+        console.log(`[AI_AGENT_API Success] Successfully generated ${data.questions ? data.questions.length : 0} questions via OpenAI.`);
+        res.json(data);
+
+    } catch (error) {
+        console.error('Error generating questions via OpenAI API:', error.message);
+        if (error.response) {
+            console.error('OpenAI Error Details:', JSON.stringify(error.response.data));
+        }
+
+        console.log(`[AI_AGENT_API Fallback] Returning mock question under error.`);
+        const mockQ = buildMockQuestion(type, topic, difficulty);
+        res.json({
+            testing_msg: "testing HI message Received an Output (fallback)",
+            ai_agent_api: aiAgentApiKey,
+            questions: [mockQ],
+            error: error.message
+        });
     }
 });
 
-// --- Code Execution Helper ---
-// --- Code Execution Helper (Piston + Local VM Integration) ---
-// --- Multi-Engine Free Code Execution Helper (Wandbox + Judge0 CE + Local VM) ---
+// --- Local Native Python Execution Helper ---
+const runLocalPython = (code, stdin = '') => {
+    return new Promise((resolve) => {
+        const tmpDir = os.tmpdir();
+        const tmpFile = path.join(tmpDir, `script_${Date.now()}_${Math.floor(Math.random() * 10000)}.py`);
+        
+        fs.writeFile(tmpFile, code, 'utf8', (err) => {
+            if (err) {
+                return resolve({
+                    stdout: '',
+                    stderr: `Failed to write python script: ${err.message}`,
+                    code: 1,
+                    output: `Failed to write python script: ${err.message}`
+                });
+            }
+
+            const child = execFile('python3', [tmpFile], { timeout: 8000, maxBuffer: 5 * 1024 * 1024, encoding: 'utf8' }, (execErr, stdout, stderr) => {
+                fs.unlink(tmpFile, () => {});
+
+                if (execErr && execErr.killed) {
+                    return resolve({
+                        stdout: stdout || '',
+                        stderr: 'Time Limit Exceeded (8 seconds max runtime).',
+                        code: 1,
+                        output: (stdout || '') + '\nTime Limit Exceeded (8 seconds max runtime).'
+                    });
+                }
+
+                const outStr = stdout || '';
+                const errStr = stderr || (execErr && !stdout ? execErr.message : '');
+
+                resolve({
+                    stdout: outStr,
+                    stderr: errStr,
+                    code: execErr ? (execErr.code || 1) : 0,
+                    output: outStr || errStr || 'Execution completed.'
+                });
+            });
+
+            if (stdin && child.stdin) {
+                child.stdin.write(stdin);
+                child.stdin.end();
+            }
+        });
+    });
+};
+
+// --- Multi-Engine Code Execution Helper (Native Local + Judge0 Public CE) ---
 const executeCode = async (language, sourceCode, stdin = '') => {
     const lang = language?.toLowerCase() || 'javascript';
 
@@ -685,7 +971,21 @@ const executeCode = async (language, sourceCode, stdin = '') => {
 
     const targetLang = langMap[lang] || 'python';
 
-    // Tier 1: Fast local JS execution
+    // 1. Native Fast Python Execution (0ms network latency, supports emojis, long scripts & loops)
+    if (targetLang === 'python') {
+        try {
+            console.log('[Native Engine] Running Python code locally via child_process...');
+            const res = await runLocalPython(sourceCode, stdin);
+            if (res.stdout || (res.code === 0 && !res.stderr.includes('python3: not found'))) {
+                return { run: res, language: 'python' };
+            }
+            console.log('[Native Python] Local python3 not installed in environment, trying cloud compiler...');
+        } catch (pyErr) {
+            console.warn('[Native Python Error]:', pyErr.message, 'Falling back to cloud API...');
+        }
+    }
+
+    // 2. Fast Local JS Execution
     if (targetLang === 'javascript' && !stdin) {
         try {
             const outputBuffer = [];
@@ -701,7 +1001,7 @@ const executeCode = async (language, sourceCode, stdin = '') => {
             };
             const script = new vm.Script(sourceCode);
             const context = vm.createContext(sandbox);
-            script.runInContext(context, { timeout: 3000 });
+            script.runInContext(context, { timeout: 4000 });
             return {
                 run: {
                     stdout: outputBuffer.join('\n'),
@@ -716,50 +1016,7 @@ const executeCode = async (language, sourceCode, stdin = '') => {
         }
     }
 
-    // Tier 2: Wandbox Free Open Compiler API (No Keys, 50+ Languages)
-    try {
-        console.log(`[Wandbox Engine] Compiling ${targetLang} code...`);
-        const wandboxCompilerMap = {
-            'python': 'python-head',
-            'javascript': 'nodejs-head',
-            'typescript': 'typescript-head',
-            'cpp': 'gcc-head',
-            'c': 'gcc-head-c',
-            'java': 'openjdk-head',
-            'csharp': 'dotnetcore-head',
-            'sql': 'sqlite-head',
-            'go': 'go-head',
-            'rust': 'rust-head',
-            'php': 'php-head',
-            'ruby': 'ruby-head'
-        };
-
-        const wandboxCompiler = wandboxCompilerMap[targetLang] || 'python-head';
-        const wandboxRes = await axios.post('https://wandbox.org/api/compile.json', {
-            compiler: wandboxCompiler,
-            code: sourceCode,
-            stdin: stdin || ''
-        }, { timeout: 10000 });
-
-        const data = wandboxRes.data;
-        const stdout = data.program_output || data.stdout || '';
-        const stderr = data.compiler_error || data.program_error || data.stderr || '';
-        const exitCode = (data.status === "0" || data.status === 0) ? 0 : 1;
-
-        return {
-            run: {
-                stdout,
-                stderr,
-                code: exitCode,
-                output: stdout || stderr || 'Execution completed with no output.'
-            },
-            language: targetLang
-        };
-    } catch (wandboxErr) {
-        console.warn('[Wandbox Engine Error]:', wandboxErr.message, 'Falling back to Judge0 Public CE...');
-    }
-
-    // Tier 3: Judge0 Free Public CE API (No API Key Required)
+    // 3. Judge0 Public CE API (No API Key Required)
     try {
         console.log(`[Judge0 Public CE] Compiling ${targetLang} code...`);
         const judge0LangMap = {
@@ -799,7 +1056,7 @@ const executeCode = async (language, sourceCode, stdin = '') => {
         };
     } catch (j0Err) {
         console.error('[Judge0 Public CE Error]:', j0Err.message);
-        throw new Error(`Code execution failed across all engines: ${j0Err.message}`);
+        throw new Error(`Code execution failed: ${j0Err.message}`);
     }
 };
 
@@ -824,28 +1081,85 @@ app.post('/api/run-code', authenticateToken, async (req, res) => {
 
 // --- Auth Routes ---
 
+// Helper to trigger n8n OTP Webhook with automatic Test/Prod URL fallback
+const triggerOtpWebhook = async ({ email, full_name, otp }) => {
+    let n8nUrl = (process.env.OTP_N8N_URL || process.env.OTP_N8n || process.env.OTP_N8N || 'https://aotms.app.n8n.cloud/webhook-test/Email').trim();
+    console.log(`[AUTH-OTP Webhook] Triggering n8n at ${n8nUrl} for ${email}...`);
+
+    try {
+        const response = await axios.post(n8nUrl, {
+            email,
+            full_name: full_name || 'Student',
+            otp
+        }, { timeout: 8000 });
+        console.log(`[AUTH-OTP Webhook] Successfully delivered OTP via n8n for ${email}:`, response.data);
+        return true;
+    } catch (err) {
+        // Automatically try swapping between test URL (/webhook-test/) and prod URL (/webhook/)
+        const altUrl = n8nUrl.includes('/webhook-test/') 
+            ? n8nUrl.replace('/webhook-test/', '/webhook/')
+            : n8nUrl.replace('/webhook/', '/webhook-test/');
+
+        console.warn(`[AUTH-OTP Webhook Primary Failed: ${err.message}]. Retrying with fallback URL: ${altUrl}...`);
+        try {
+            const altResponse = await axios.post(altUrl, {
+                email,
+                full_name: full_name || 'Student',
+                otp
+            }, { timeout: 8000 });
+            console.log(`[AUTH-OTP Webhook Fallback] Successfully delivered OTP via n8n (${altUrl}) for ${email}:`, altResponse.data);
+            return true;
+        } catch (fallbackErr) {
+            console.error(`[AUTH-OTP Webhook Error]: n8n Webhook failed (${err.message} / ${fallbackErr.message}).`);
+            
+            // ── Brevo SMTP Fallback Disabled (Uncomment below to re-enable Brevo SMTP if needed) ──
+            /*
+            const otpHtml = `
+                <div style="font-family: 'Outfit', 'Inter', sans-serif; max-width: 500px; margin: 0 auto; padding: 24px; border-radius: 16px; background: #ffffff; border: 1px solid #e2e8f0;">
+                    <h2 style="color: #0f172a;">Academy of Tech Masters</h2>
+                    <p>Hello ${full_name || 'Student'}, your verification OTP code is:</p>
+                    <div style="background: #f8fafc; font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #1e3a8a; text-align: center; padding: 16px; border-radius: 12px; margin: 20px 0;">${otp}</div>
+                    <p style="font-size: 12px; color: #64748b;">This OTP is valid for 5 minutes.</p>
+                </div>
+            `;
+            await sendEmail({
+                to: email,
+                subject: `🎉 Email Verification OTP: ${otp} | Academy of Tech Masters`,
+                html: otpHtml
+            });
+            */
+            return false;
+        }
+    }
+};
+
 app.post('/api/auth/send-otp', async (req, res) => {
     const { email, full_name } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     try {
+        const existingOtp = await OTP.findOne({ email });
+        if (existingOtp) {
+            const timePassed = Date.now() - new Date(existingOtp.created_at).getTime();
+            if (timePassed < 60 * 1000) {
+                const waitSeconds = Math.ceil((60 * 1000 - timePassed) / 1000);
+                return res.status(429).json({ error: `Please wait ${waitSeconds} seconds before requesting another OTP.` });
+            }
+        }
+
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 min
 
         await OTP.findOneAndUpdate(
             { email },
-            { otp, full_name, expires_at: expiresAt },
+            { otp, full_name, expires_at: expiresAt, created_at: new Date() },
             { upsert: true, returnDocument: 'after' }
         );
 
-        console.log(`[AUTH-OTP] OTP for ${email}: ${otp}`);
+        console.log(`[AUTH-OTP] Generated OTP for ${email}: ${otp}`);
 
-        // Trigger n8n webhook (Legacy support)
-        if (process.env.N8N_EMAIL_WEBHOOK_URL) {
-            axios.post(process.env.N8N_EMAIL_WEBHOOK_URL, {
-                event: 'otp_request', email, otp, full_name, timestamp: new Date()
-            }).catch(e => console.error('n8n OTP trigger failed:', e.message));
-        }
+        // Trigger n8n Webhook for OTP Email
+        await triggerOtpWebhook({ email, full_name, otp });
 
         res.json({ message: 'OTP sent successfully' });
     } catch (err) {
@@ -854,26 +1168,31 @@ app.post('/api/auth/send-otp', async (req, res) => {
 });
 
 app.post('/api/auth/resend-otp', async (req, res) => {
-    // Reuse logic, maybe separate if needed differently
     const { email, full_name } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     try {
+        const existingOtp = await OTP.findOne({ email });
+        if (existingOtp) {
+            const timePassed = Date.now() - new Date(existingOtp.created_at).getTime();
+            if (timePassed < 60 * 1000) {
+                const waitSeconds = Math.ceil((60 * 1000 - timePassed) / 1000);
+                return res.status(429).json({ error: `Please wait ${waitSeconds} seconds before requesting another OTP.` });
+            }
+        }
+
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
         await OTP.findOneAndUpdate(
             { email },
-            { otp, full_name, expires_at: expiresAt },
+            { otp, full_name, expires_at: expiresAt, created_at: new Date() },
             { upsert: true, returnDocument: 'after' }
         );
         console.log(`[AUTH-OTP] Resent OTP for ${email}: ${otp}`);
 
-        if (process.env.N8N_EMAIL_WEBHOOK_URL) {
-            axios.post(process.env.N8N_EMAIL_WEBHOOK_URL, {
-                event: 'otp_request', email, otp, full_name, timestamp: new Date()
-            }).catch(e => console.error('n8n OTP trigger failed:', e.message));
-        }
+        // Trigger n8n Webhook for OTP Email
+        await triggerOtpWebhook({ email, full_name, otp });
 
         res.json({ message: 'OTP resent successfully' });
     } catch (err) {
@@ -888,14 +1207,32 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     try {
         const otpDoc = await OTP.findOne({ email });
         if (!otpDoc) return res.status(400).json({ error: 'No OTP found' });
-        if (otpDoc.otp !== otp) return res.status(400).json({ error: 'Invalid OTP' });
         if (new Date() > otpDoc.expires_at) return res.status(400).json({ error: 'OTP expired' });
+
+        if (otpDoc.failed_attempts >= 5) {
+            return res.status(400).json({ error: 'Too many failed attempts. Please request a new OTP.' });
+        }
+
+        if (otpDoc.otp !== otp) {
+            otpDoc.failed_attempts = (otpDoc.failed_attempts || 0) + 1;
+            await otpDoc.save();
+
+            const remaining = 5 - otpDoc.failed_attempts;
+            if (remaining <= 0) {
+                await OTP.deleteOne({ email });
+                return res.status(400).json({ error: 'Too many failed attempts. OTP has been invalidated. Please request a new OTP.' });
+            }
+            return res.status(400).json({ error: `Invalid OTP. You have ${remaining} attempts remaining.` });
+        }
 
         await VerifiedEmail.findOneAndUpdate(
             { email },
             { verified: true, verified_at: new Date() },
             { upsert: true }
         );
+
+        // Delete successful OTP
+        await OTP.deleteOne({ email });
 
         res.json({ success: true, message: 'OTP verified' });
     } catch (err) {
@@ -904,6 +1241,19 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 });
 
 app.post('/api/auth/logout', (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token) {
+        try {
+            const decoded = jwt.verify(token, JWT_SECRET);
+            if (decoded && decoded.id) {
+                blacklistUserTokens(decoded.id);
+            }
+        } catch (e) {
+            // Expired or invalid access token is fine, still clear the refresh cookie
+        }
+    }
+    res.clearCookie('refresh_token', getClearRefreshTokenCookieOptions());
     res.json({ success: true, message: 'Logged out successfully' });
 });
 
@@ -917,17 +1267,26 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         const { email } = req.body;
         if (!email) return res.status(400).json({ error: 'Email is required' });
 
+        const existingRecord = resetOtpStore.get(email.toLowerCase().trim());
+        if (existingRecord) {
+            const timePassed = Date.now() - existingRecord.createdAt;
+            if (timePassed < 60 * 1000) {
+                const waitSeconds = Math.ceil((60 * 1000 - timePassed) / 1000);
+                return res.status(429).json({ error: `Please wait ${waitSeconds} seconds before requesting another OTP.` });
+            }
+        }
+
         // Check user exists case-insensitively
         const user = await User.findOne({ email: { $regex: new RegExp("^" + email.trim() + "$", "i") } });
         if (!user) return res.status(404).json({ error: 'No account found with this email.' });
 
         // Generate random 6-digit OTP
         const otp = String(Math.floor(100000 + Math.random() * 900000));
-        const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+        const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
 
         // Store OTP (store as lowercase email in key for consistency)
-        resetOtpStore.set(email.toLowerCase().trim(), { otp, expiresAt });
-        setTimeout(() => resetOtpStore.delete(email.toLowerCase().trim()), 10 * 60 * 1000);
+        resetOtpStore.set(email.toLowerCase().trim(), { otp, expiresAt, failedAttempts: 0, createdAt: Date.now() });
+        setTimeout(() => resetOtpStore.delete(email.toLowerCase().trim()), 5 * 60 * 1000);
 
         // Call n8n webhook — it emails the OTP to the user
         try {
@@ -965,8 +1324,19 @@ app.post('/api/auth/verify-reset-otp', async (req, res) => {
             resetOtpStore.delete(email.toLowerCase().trim());
             return res.status(400).json({ error: 'OTP has expired. Request a new one.' });
         }
+        if (record.failedAttempts >= 5) {
+            resetOtpStore.delete(email.toLowerCase().trim());
+            return res.status(400).json({ error: 'Too many failed attempts. OTP has been invalidated. Please request a new one.' });
+        }
+
         if (String(otp).trim() !== record.otp) {
-            return res.status(400).json({ error: 'Invalid OTP. Please check and try again.' });
+            record.failedAttempts = (record.failedAttempts || 0) + 1;
+            const remaining = 5 - record.failedAttempts;
+            if (remaining <= 0) {
+                resetOtpStore.delete(email.toLowerCase().trim());
+                return res.status(400).json({ error: 'Too many failed attempts. OTP has been invalidated. Please request a new one.' });
+            }
+            return res.status(400).json({ error: `Invalid OTP. You have ${remaining} attempts remaining.` });
         }
 
         console.log(`[ForgotPassword] OTP verified for ${email}`);
@@ -981,7 +1351,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
     try {
         const { email, otp, new_password } = req.body;
         if (!email || !otp || !new_password) return res.status(400).json({ error: 'All fields required' });
-        if (new_password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+        if (!isPasswordStrong(new_password)) {
+            return res.status(400).json({ error: 'Password must be at least 8 characters, and contain mixed case, numbers, and special characters.' });
+        }
 
         // Re-verify OTP for security
         const record = resetOtpStore.get(email.toLowerCase().trim());
@@ -993,7 +1365,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
         const user = await User.findOne({ email: { $regex: new RegExp("^" + email.trim() + "$", "i") } });
         if (!user) return res.status(404).json({ error: 'No account found with this email.' });
 
-        const salt = await bcrypt.genSalt(10);
+        const salt = await bcrypt.genSalt(12);
         user.password_hash = await bcrypt.hash(new_password, salt);
         await user.save();
 
@@ -1006,15 +1378,34 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 app.post('/api/auth/refresh', async (req, res) => {
-    const { refresh_token } = req.body;
-    if (!refresh_token) return res.status(400).json({ error: 'Refresh token required' });
-    // In a real app, verify refresh_token in DB. For now, we just mock success if token exists.
-    res.json({
-        session: {
-            access_token: 'new_mock_token_' + Date.now(),
-            refresh_token: 'new_mock_refresh_' + Date.now()
-        }
-    });
+    const refreshToken = getCookie(req, 'refresh_token') || req.body?.refresh_token;
+    if (!refreshToken) return res.status(401).json({ error: 'Refresh token is missing' });
+
+    try {
+        const decoded = jwt.verify(refreshToken, JWT_SECRET);
+        const user = await User.findById(decoded.id);
+        if (!user) return res.status(401).json({ error: 'User session no longer valid' });
+
+        // Unblacklist user if previously blacklisted
+        tokenBlacklist.delete(`user:${user._id.toString()}`);
+
+        // Generate new token pair
+        const newAccessToken = generateToken(user);
+        const newRefreshToken = generateRefreshToken(user);
+
+        // Update the HttpOnly cookie
+        res.cookie('refresh_token', newRefreshToken, getRefreshTokenCookieOptions());
+
+        res.json({
+            session: {
+                access_token: newAccessToken,
+                expires_in: 1800
+            }
+        });
+    } catch (err) {
+        console.error('[Refresh Token Error]:', err.message);
+        return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
 });
 
 app.post('/api/public/enroll', async (req, res) => {
@@ -1031,12 +1422,29 @@ app.post('/api/public/enroll', async (req, res) => {
 });
 
 app.post('/api/auth/signup', async (req, res) => {
-    const { email, password, fullName, phone, collegeName, instituteName, city, district, country, fullAddress, latitude, longitude } = req.body;
+    const { email, password, fullName, phone, courseType, collegeName, instituteName, city, district, country, fullAddress, latitude, longitude, captcha_token } = req.body;
     try {
+        // 1. CAPTCHA verification
+        const isValidCaptcha = await verifyRecaptcha(captcha_token || req.body['g-recaptcha-response']);
+        if (!isValidCaptcha) {
+            return res.status(400).json({ error: 'CAPTCHA verification failed. Please try again.' });
+        }
+
+        // 2. Email verification check
+        const isVerified = await VerifiedEmail.findOne({ email: email.toLowerCase().trim(), verified: true });
+        if (!isVerified) {
+            return res.status(401).json({ error: 'Email must be verified before completing registration.' });
+        }
+
+        // 3. Password strength check
+        if (!isPasswordStrong(password)) {
+            return res.status(400).json({ error: 'Password must be at least 8 characters, and contain mixed case, numbers, and special characters.' });
+        }
+
         const existingUser = await User.findOne({ email });
         if (existingUser) return res.status(400).json({ error: 'User already exists' });
 
-        const salt = await bcrypt.genSalt(10);
+        const salt = await bcrypt.genSalt(12);
         const passwordHash = await bcrypt.hash(password, salt);
         const avatarUrl = `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}&background=random&color=fff`;
 
@@ -1044,6 +1452,10 @@ app.post('/api/auth/signup', async (req, res) => {
         const now = new Date();
         const registrationDate = now.toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' });
         const registrationTime = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+        // Determine role based on courseType
+        // internship → 'intern', everything else → 'student'
+        const assignedRole = courseType === 'internship' ? 'intern' : 'student';
 
         // Create User
         const user = await User.create({
@@ -1056,7 +1468,7 @@ app.post('/api/auth/signup', async (req, res) => {
             registration_time: registrationTime
         });
 
-        // Create Profile
+        // Create Profile (include course_type)
         await Profile.create({
             user_id: user._id,
             email,
@@ -1065,6 +1477,7 @@ app.post('/api/auth/signup', async (req, res) => {
             mobile_number: phone,
             college_name: collegeName,
             institute_name: instituteName,
+            course_type: courseType || 'full_time',
             registration_date: registrationDate,
             registration_time: registrationTime,
             city,
@@ -1076,16 +1489,20 @@ app.post('/api/auth/signup', async (req, res) => {
             approval_status: 'pending'
         });
 
-        // Create Role
+        // Create Role based on courseType
         await UserRole.create({
             user_id: user._id,
-            role: 'student'
+            role: assignedRole
         });
 
+        tokenBlacklist.delete(`user:${user._id.toString()}`);
         const token = generateToken(user);
+        const refreshToken = generateRefreshToken(user);
+        res.cookie('refresh_token', refreshToken, getRefreshTokenCookieOptions());
+
         res.json({
-            user: { id: user._id, email, full_name: fullName, avatar_url: avatarUrl },
-            session: { access_token: token, expires_in: 604800 }
+            user: { id: user._id, email, full_name: fullName, avatar_url: avatarUrl, role: assignedRole },
+            session: { access_token: token, expires_in: 1800 }
         });
 
     } catch (err) {
@@ -1093,11 +1510,30 @@ app.post('/api/auth/signup', async (req, res) => {
     }
 });
 
+const loginIpLimitStore = new Map();
+
 app.post('/api/auth/login', async (req, res) => {
-    const { email, password } = req.body;
+    const { email, password, captcha_token } = req.body;
     try {
-        const user = await User.findOne({ email: { $regex: new RegExp("^" + email.trim() + "$", "i") } });
         const loginIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+        // 1. CAPTCHA verification
+        const isValidCaptcha = await verifyRecaptcha(captcha_token || req.body['g-recaptcha-response']);
+        if (!isValidCaptcha) {
+            return res.status(400).json({ error: 'CAPTCHA verification failed. Please try again.' });
+        }
+
+        // Login Rate Limit: 5 requests / 15 min per IP
+        const now = Date.now();
+        let ipAttempts = loginIpLimitStore.get(loginIp) || [];
+        ipAttempts = ipAttempts.filter(ts => now - ts < 15 * 60 * 1000);
+        if (ipAttempts.length >= 5) {
+            return res.status(429).json({ error: 'Too many login attempts from this IP. Please try again after 15 minutes.' });
+        }
+        ipAttempts.push(now);
+        loginIpLimitStore.set(loginIp, ipAttempts);
+
+        const user = await User.findOne({ email: { $regex: new RegExp("^" + email.trim() + "$", "i") } });
 
         if (!user) {
             // Log generic failed attempt for unknown user
@@ -1109,39 +1545,21 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
-        const isMatch = await bcrypt.compare(password, user.password_hash);
-
-        if (!isMatch) {
-            // Brute force protection
-            user.failed_login_attempts = (user.failed_login_attempts || 0) + 1;
-            await user.save();
-
-            let errorMessage = 'Invalid credentials';
-
-            if (user.failed_login_attempts >= 3) {
-                await Profile.findOneAndUpdate({ user_id: user._id }, { approval_status: 'suspended' });
-                await SecurityEvent.create({
-                    event_type: 'account_auto_suspended',
-                    ip_address: loginIp,
-                    user_id: user._id,
-                    details: { reason: 'Too many failed login attempts', attempts: user.failed_login_attempts }
-                });
-                errorMessage = 'Account suspended due to too many failed attempts. Contact Administrator.';
-            }
-
-            return res.status(401).json({ error: errorMessage });
-        }
-
-        // Update last login info
-        user.last_login_at = new Date();
-        user.last_login_ip = loginIp;
-        await user.save();
-
-        // Check if suspended
+        // Check if suspended/locked before bcrypt check
         const [profile, roleDoc] = await Promise.all([
             Profile.findOne({ user_id: user._id }),
             UserRole.findOne({ user_id: user._id })
         ]);
+
+        const userRole = roleDoc ? roleDoc.role : 'student';
+
+        // 2. Email verification check (non-admins must be verified prior to login)
+        if (userRole !== 'admin') {
+            const isVerified = await VerifiedEmail.findOne({ email: email.toLowerCase().trim(), verified: true });
+            if (!isVerified) {
+                return res.status(401).json({ error: 'Email verification is required before login.' });
+            }
+        }
 
         if (profile?.approval_status === 'suspended') {
             // Check if auto-unsuspend is applicable
@@ -1150,16 +1568,48 @@ app.post('/api/auth/login', async (req, res) => {
                 profile.suspended_until = null;
                 await profile.save();
             } else {
+                if (profile?.suspended_until) {
+                    const timeLeftMs = new Date(profile.suspended_until).getTime() - Date.now();
+                    const timeLeftMins = Math.ceil(timeLeftMs / (60 * 1000));
+                    return res.status(403).json({ error: `Account locked due to too many failed attempts. Try again in ${timeLeftMins} minutes.` });
+                }
                 return res.status(403).json({ error: 'Your account is suspended. Please contact the administrator.' });
             }
         }
 
-        // Login Success Housekeeping
+        const isMatch = await bcrypt.compare(password, user.password_hash);
+
+        if (!isMatch) {
+            // Brute force protection: 5 attempts -> 15 min lock
+            user.failed_login_attempts = (user.failed_login_attempts || 0) + 1;
+            await user.save();
+
+            let errorMessage = 'Invalid credentials';
+            const remaining = 5 - user.failed_login_attempts;
+
+            if (user.failed_login_attempts >= 5) {
+                const lockTime = new Date(Date.now() + 15 * 60 * 1000); // 15 min lock
+                await Profile.findOneAndUpdate({ user_id: user._id }, { approval_status: 'suspended', suspended_until: lockTime });
+                await SecurityEvent.create({
+                    event_type: 'account_auto_locked',
+                    ip_address: loginIp,
+                    user_id: user._id,
+                    details: { reason: '5 failed login attempts', attempts: user.failed_login_attempts }
+                });
+                errorMessage = 'Account locked due to too many failed attempts. Try again in 15 minutes.';
+            } else {
+                errorMessage = `Invalid credentials. You have ${remaining} attempts remaining before account lock.`;
+            }
+
+            return res.status(401).json({ error: errorMessage });
+        }
+
+        // Update last login info & housekeeping
+        user.last_login_at = new Date();
         user.failed_login_attempts = 0;
         user.last_login_ip = loginIp;
         await user.save();
 
-        const userRole = roleDoc ? roleDoc.role : 'student';
         const loginTime = new Date().toISOString();
 
         console.log(`[Auth] Login Successful: ${email} | Role: ${userRole}`);
@@ -1168,7 +1618,7 @@ app.post('/api/auth/login', async (req, res) => {
         // Admin must verify via OTP before receiving an access token
         if (userRole === 'admin') {
             const otp = Math.floor(100000 + Math.random() * 900000).toString();
-            const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+            const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 min
 
             await OTP.findOneAndUpdate(
                 { email },
@@ -1184,25 +1634,48 @@ app.post('/api/auth/login', async (req, res) => {
                 details: { email, timestamp: loginTime }
             });
 
-            // Call n8n webhook to deliver OTP to admin email
-            axios.post('https://aotms.app.n8n.cloud/webhook/Email', {
-                event: 'admin_login_otp',
-                email,
-                otp,
-                full_name: user.full_name,
-                ip: loginIp,
-                time: loginTime,
-                message: 'Your Admin Login OTP'
-            })
-                .then(() => console.log(`[Security] Admin OTP webhook SUCCESS for ${email}`))
-                .catch(e => console.error(`[Security] Admin OTP webhook ERROR:`, e.message));
+            // Send Admin Login OTP directly via Resend email helper
+            const otpHtml = `
+                <div style="font-family: 'Outfit', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #334155; max-width: 500px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);">
+                    <div style="text-align: center; margin-bottom: 24px;">
+                        <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); width: 56px; height: 56px; border-radius: 14px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 12px; color: #ffffff; font-size: 20px; font-weight: 800; line-height: 56px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-left: auto; margin-right: auto;">A</div>
+                        <h2 style="color: #0f172a; margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.02em;">Academy of Tech Masters</h2>
+                        <p style="color: #ea580c; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin: 4px 0 0 0;">Admin Security Authentication</p>
+                    </div>
+                    <p style="font-size: 15px; color: #334155; margin-top: 0; font-weight: 600;">Hello ${user.full_name || 'Admin'},</p>
+                    <p style="font-size: 14px; color: #475569;">A login attempt was initiated on your administrator platform account. Use the following security code to authenticate. This code is valid for 10 minutes:</p>
+                    <div style="background: #fdf8f6; border: 1px dashed #fdba74; border-radius: 12px; text-align: center; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #ea580c; padding: 18px; margin: 24px 0; text-shadow: 0 1px 1px rgba(0,0,0,0.05); font-family: monospace;">
+                        ${otp}
+                    </div>
+                    <div style="background-color: #f8fafc; padding: 16px; border-radius: 12px; border: 1px solid #e2e8f0; margin: 20px 0; font-size: 13px; color: #475569;">
+                        <p style="font-weight: 700; color: #1e293b; margin: 0 0 8px 0;">Login Details:</p>
+                        <p style="margin: 0 0 4px 0;"><strong>IP Address:</strong> ${loginIp}</p>
+                        <p style="margin: 0;"><strong>Time:</strong> ${loginTime}</p>
+                    </div>
+                    <p style="font-size: 12px; color: #ef4444; font-weight: 600; margin-bottom: 0;">If this login attempt was not initiated by you, please secure your credentials immediately.</p>
+                    <div style="margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 16px; text-align: center;">
+                        <p style="font-size: 11px; color: #94a3b8; margin: 0 0 4px 0;">Academy of Tech Masters Security Team.</p>
+                        <p style="font-size: 11px; color: #94a3b8; margin: 0;">&copy; ${new Date().getFullYear()} <a href="https://aotms.com" style="color: #3b82f6; text-decoration: none; font-weight: 600;">aotms.com</a>. All rights reserved.</p>
+                    </div>
+                </div>
+            `;
 
-            console.log(`[Security] Admin OTP sent to ${email}: ${otp}`);
+            try {
+                await triggerOtpWebhook({ email, full_name: user.full_name, otp });
+                console.log(`[Security] Admin OTP sent successfully via n8n to ${email}`);
+            } catch (e) {
+                console.error(`[Security] Admin OTP API error:`, e.message);
+            }
+
+            console.log(`[Security] Admin OTP generated and scheduled for ${email}: ${otp}`);
             return res.json({ requiresOtp: true, message: 'OTP sent to your admin email' });
         }
         // ----------------------
 
+        tokenBlacklist.delete(`user:${user._id.toString()}`);
         const token = generateToken(user);
+        const refreshToken = generateRefreshToken(user);
+        res.cookie('refresh_token', refreshToken, getRefreshTokenCookieOptions());
 
         res.json({
             user: {
@@ -1214,7 +1687,7 @@ app.post('/api/auth/login', async (req, res) => {
                 approval_status: profile ? profile.approval_status : 'pending',
                 suspended_until: profile ? profile.suspended_until : null
             },
-            session: { access_token: token, expires_in: 604800 }
+            session: { access_token: token, expires_in: 1800 }
         });
 
     } catch (err) {
@@ -1231,8 +1704,27 @@ app.post('/api/auth/admin-verify-otp', async (req, res) => {
     try {
         const otpRecord = await OTP.findOne({ email });
         if (!otpRecord) return res.status(400).json({ error: 'OTP not found. Please log in again.' });
-        if (otpRecord.otp !== otp) return res.status(400).json({ error: 'Invalid OTP. Please try again.' });
-        if (new Date() > new Date(otpRecord.expires_at)) return res.status(400).json({ error: 'OTP has expired. Please log in again.' });
+        if (new Date() > new Date(otpRecord.expires_at)) {
+            await OTP.deleteOne({ email });
+            return res.status(400).json({ error: 'OTP has expired. Please log in again.' });
+        }
+
+        if (otpRecord.failed_attempts >= 5) {
+            await OTP.deleteOne({ email });
+            return res.status(400).json({ error: 'Too many failed attempts. OTP has been invalidated. Please log in again.' });
+        }
+
+        if (otpRecord.otp !== otp) {
+            otpRecord.failed_attempts = (otpRecord.failed_attempts || 0) + 1;
+            await otpRecord.save();
+
+            const remaining = 5 - otpRecord.failed_attempts;
+            if (remaining <= 0) {
+                await OTP.deleteOne({ email });
+                return res.status(400).json({ error: 'Too many failed attempts. OTP has been invalidated. Please log in again.' });
+            }
+            return res.status(400).json({ error: `Invalid OTP. You have ${remaining} attempts remaining.` });
+        }
 
         // Consume the OTP
         await OTP.deleteOne({ email });
@@ -1248,6 +1740,7 @@ app.post('/api/auth/admin-verify-otp', async (req, res) => {
         const userRole = roleDoc ? roleDoc.role : 'student';
         if (userRole !== 'admin') return res.status(403).json({ error: 'Admin access only.' });
 
+        tokenBlacklist.delete(`user:${user._id.toString()}`);
         const token = generateToken(user);
         const loginTime = new Date().toISOString();
         const loginIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -1267,6 +1760,9 @@ app.post('/api/auth/admin-verify-otp', async (req, res) => {
 
         console.log(`[Security] Admin OTP verified — login complete for ${email}`);
 
+        const refreshToken = generateRefreshToken(user);
+        res.cookie('refresh_token', refreshToken, getRefreshTokenCookieOptions());
+
         res.json({
             user: {
                 id: user._id,
@@ -1277,7 +1773,7 @@ app.post('/api/auth/admin-verify-otp', async (req, res) => {
                 approval_status: profile ? profile.approval_status : 'approved',
                 suspended_until: profile ? profile.suspended_until : null
             },
-            session: { access_token: token, expires_in: 604800 }
+            session: { access_token: token, expires_in: 1800 }
         });
     } catch (err) {
         handleError(res, err, 'admin-verify-otp');
@@ -1296,25 +1792,55 @@ app.post('/api/auth/admin-resend-otp', async (req, res) => {
         const roleDoc = await UserRole.findOne({ user_id: user._id });
         if (!roleDoc || roleDoc.role !== 'admin') return res.status(403).json({ error: 'Admin access only.' });
 
+        const existingOtp = await OTP.findOne({ email });
+        if (existingOtp) {
+            const timePassed = Date.now() - new Date(existingOtp.created_at).getTime();
+            if (timePassed < 60 * 1000) {
+                const waitSeconds = Math.ceil((60 * 1000 - timePassed) / 1000);
+                return res.status(429).json({ error: `Please wait ${waitSeconds} seconds before requesting another OTP.` });
+            }
+        }
+
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
         await OTP.findOneAndUpdate(
             { email },
-            { otp, full_name: user.full_name, expires_at: expiresAt },
+            { otp, full_name: user.full_name, expires_at: expiresAt, created_at: new Date() },
             { upsert: true, returnDocument: 'after' }
         );
 
-        axios.post('https://aotms.app.n8n.cloud/webhook/Email', {
-            event: 'admin_login_otp',
-            email,
-            otp,
-            full_name: user.full_name,
-            time: new Date().toISOString(),
-            message: 'Your Admin Login OTP (Resent)'
-        })
-            .then(() => console.log(`[Security] Admin OTP resend webhook SUCCESS for ${email}`))
-            .catch(e => console.error(`[Security] Admin OTP resend webhook ERROR:`, e.message));
+        // Send Admin Login OTP directly via Resend email helper
+        const otpHtml = `
+            <div style="font-family: 'Outfit', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #334155; max-width: 500px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);">
+                <div style="text-align: center; margin-bottom: 24px;">
+                    <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); width: 56px; height: 56px; border-radius: 14px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 12px; color: #ffffff; font-size: 20px; font-weight: 800; line-height: 56px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-left: auto; margin-right: auto;">A</div>
+                    <h2 style="color: #0f172a; margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.02em;">Academy of Tech Masters</h2>
+                    <p style="color: #ea580c; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin: 4px 0 0 0;">Admin Security Authentication</p>
+                </div>
+                <p style="font-size: 15px; color: #334155; margin-top: 0; font-weight: 600;">Hello ${user.full_name || 'Admin'},</p>
+                <p style="font-size: 14px; color: #475569;">A login attempt was initiated on your administrator platform account. Use the following security code to authenticate. This code is valid for 10 minutes:</p>
+                <div style="background: #fdf8f6; border: 1px dashed #fdba74; border-radius: 12px; text-align: center; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #ea580c; padding: 18px; margin: 24px 0; text-shadow: 0 1px 1px rgba(0,0,0,0.05); font-family: monospace;">
+                    ${otp}
+                </div>
+                <div style="background-color: #f8fafc; padding: 16px; border-radius: 12px; border: 1px solid #e2e8f0; margin: 20px 0; font-size: 13px; color: #475569;">
+                    <p style="font-weight: 700; color: #1e293b; margin: 0 0 8px 0;">Login Details (Resent):</p>
+                    <p style="margin: 0;"><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+                </div>
+                <p style="font-size: 12px; color: #ef4444; font-weight: 600; margin-bottom: 0;">If this login attempt was not initiated by you, please secure your credentials immediately.</p>
+                <div style="margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 16px; text-align: center;">
+                    <p style="font-size: 11px; color: #94a3b8; margin: 0 0 4px 0;">Academy of Tech Masters Security Team.</p>
+                    <p style="font-size: 11px; color: #94a3b8; margin: 0;">&copy; ${new Date().getFullYear()} <a href="https://aotms.com" style="color: #3b82f6; text-decoration: none; font-weight: 600;">aotms.com</a>. All rights reserved.</p>
+                </div>
+            </div>
+        `;
+
+        try {
+            await triggerOtpWebhook({ email, full_name: user.full_name, otp });
+            console.log(`[Security] Admin OTP resent successfully via n8n to ${email}`);
+        } catch (e) {
+            console.error(`[Security] Admin OTP Resend API error (Resend):`, e.message);
+        }
 
         console.log(`[Security] Admin OTP resent to ${email}: ${otp}`);
         res.json({ message: 'OTP resent successfully' });
@@ -1505,15 +2031,34 @@ app.post('/api/admin/send-approval-email', authenticateToken, requireAdmin, asyn
         const profile = await Profile.findOne({ user_id: userId });
         if (!profile) return res.status(404).json({ error: 'User not found' });
 
-        if (process.env.N8N_EMAIL_WEBHOOK_URL) {
-            axios.post(process.env.N8N_EMAIL_WEBHOOK_URL, {
-                event: 'user_approved',
-                email: profile.email,
-                full_name: profile.full_name,
-                user_id: userId,
-                timestamp: new Date()
-            }).catch(e => console.error('n8n trigger failed', e.message));
-        }
+        const approvalHtml = `
+            <div style="font-family: 'Outfit', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #334155; max-width: 600px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);">
+                <div style="text-align: center; margin-bottom: 28px;">
+                    <div style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); width: 64px; height: 64px; border-radius: 16px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 16px; color: #ffffff; font-size: 24px; font-weight: 800; line-height: 64px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-left: auto; margin-right: auto;">✓</div>
+                    <h2 style="color: #0f172a; margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -0.03em;">Academy of Tech Masters</h2>
+                    <p style="color: #10b981; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; margin: 4px 0 0 0;">Account Approved Successfully</p>
+                </div>
+                <div style="background-color: #f8fafc; border-radius: 16px; padding: 24px; border: 1px solid #f1f5f9; margin-bottom: 24px;">
+                    <p style="font-size: 16px; font-weight: 700; color: #1e293b; margin-top: 0; margin-bottom: 12px;">Dear ${profile.full_name || 'Student'},</p>
+                    <p style="font-size: 15px; color: #334155; margin-bottom: 12px;">We are pleased to inform you that your account at <strong>Academy of Tech Masters</strong> has been approved by the school administrator!</p>
+                    <p style="font-size: 15px; color: #334155; margin-bottom: 0;">You can now log in to the platform and access your courses, classroom sessions, and records.</p>
+                </div>
+                <div style="text-align: center; margin: 28px 0;">
+                    <a href="https://aotms.com" style="background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%); color: #ffffff; padding: 14px 32px; text-decoration: none; font-weight: 700; font-size: 14px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);">Access LMS Portal</a>
+                </div>
+                <div style="margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 20px; text-align: center;">
+                    <p style="font-size: 12px; color: #94a3b8; margin: 0 0 6px 0;">If you have any questions, please contact our support team at <a href="mailto:aotms.marketing@gmail.com" style="color: #3b82f6; text-decoration: none;">aotms.marketing@gmail.com</a>.</p>
+                    <p style="font-size: 12px; color: #94a3b8; margin: 0;">&copy; ${new Date().getFullYear()} <a href="https://aotms.com" style="color: #3b82f6; text-decoration: none; font-weight: 600;">aotms.com</a>. All rights reserved.</p>
+                </div>
+            </div>
+        `;
+
+        await sendEmail({
+            to: profile.email,
+            subject: 'Your Account is Approved! | Academy of Tech Masters',
+            html: approvalHtml
+        });
+
         res.json({ message: 'Approval email sent' });
     } catch (err) {
         handleError(res, err, 'send-approval-email');
@@ -1530,40 +2075,43 @@ app.post('/api/admin/send-student-email', authenticateToken, requireAdminOrManag
             return res.status(404).json({ error: 'Student profile not found' });
         }
 
-        const n8nUrl = process.env.N8N_ADMIN_STUDENT_EMAIL_URL;
-        if (!n8nUrl) {
-            console.error('[Admin Email] N8N_ADMIN_STUDENT_EMAIL_URL not found in .env');
-            return res.status(500).json({ error: 'Mail webhook not configured in system environment' });
-        }
+        const welcomeHtml = `
+            <div style="font-family: 'Outfit', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #334155; max-width: 600px; margin: 0 auto; padding: 32px 24px; border: 1px solid #e2e8f0; border-radius: 20px; background-color: #ffffff; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);">
+                <div style="text-align: center; margin-bottom: 28px;">
+                    <div style="background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); width: 64px; height: 64px; border-radius: 16px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 16px; color: #ffffff; font-size: 24px; font-weight: 800; line-height: 64px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-left: auto; margin-right: auto;">A</div>
+                    <h2 style="color: #0f172a; margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -0.03em;">Academy of Tech Masters</h2>
+                    <p style="color: #3b82f6; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; margin: 4px 0 0 0;">LMS Portal Onboarding</p>
+                </div>
+                <div style="background-color: #f8fafc; border-radius: 16px; padding: 24px; border: 1px solid #f1f5f9; margin-bottom: 24px;">
+                    <p style="font-size: 16px; font-weight: 700; color: #1e293b; margin-top: 0; margin-bottom: 12px;">Dear ${profile.full_name || 'Student'},</p>
+                    <p style="font-size: 15px; color: #334155; margin-bottom: 12px;">Your profile is completely configured on our LMS system. You can log in and manage your assignments, attendance records, study modules, and track your ongoing exam results.</p>
+                    
+                    <div style="background-color: #ffffff; padding: 18px; border-radius: 12px; border: 1px solid #e2e8f0; margin: 20px 0;">
+                        <p style="font-size: 14px; font-weight: 700; color: #1e293b; margin: 0 0 8px 0;">Your Registered Login Details:</p>
+                        <p style="font-size: 14px; color: #475569; margin: 0 0 6px 0;"><strong>LMS URL:</strong> <a href="https://aotms.com" style="color: #3b82f6; text-decoration: none; font-weight: 600;">aotms.com</a></p>
+                        <p style="font-size: 14px; color: #475569; margin: 0;"><strong>Username:</strong> ${profile.email}</p>
+                    </div>
+                    
+                    <p style="font-size: 14px; color: #475569; margin-bottom: 0;">If you are logging in for the first time, click the button below to sign in or reset your password using the "Forgot Password" link on the login page.</p>
+                </div>
+                <div style="text-align: center; margin: 28px 0;">
+                    <a href="https://aotms.com" style="background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%); color: #ffffff; padding: 14px 32px; text-decoration: none; font-weight: 700; font-size: 14px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);">Sign In to LMS</a>
+                </div>
+                <div style="margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 20px; text-align: center;">
+                    <p style="font-size: 12px; color: #94a3b8; margin: 0 0 6px 0;">This email was sent via administrative action. For any queries, reach us at <a href="mailto:aotms.marketing@gmail.com" style="color: #3b82f6; text-decoration: none;">aotms.marketing@gmail.com</a>.</p>
+                    <p style="font-size: 12px; color: #94a3b8; margin: 0;">&copy; ${new Date().getFullYear()} <a href="https://aotms.com" style="color: #3b82f6; text-decoration: none; font-weight: 600;">aotms.com</a>. All rights reserved.</p>
+                </div>
+            </div>
+        `;
 
-        // Prepare payload as per email.json specification
-        const payload = {
-            email: profile.email,
-            full_name: profile.full_name,
-            user_id: userId,
-            sent_at: new Date().toISOString(),
-            triggered_by: req.user.id
-        };
-
-        console.log(`[Admin Email] Triggering n8n sequence for ${profile.email}`);
-
-        await axios.post(n8nUrl, payload, {
-            timeout: 10000 // 10s timeout
+        await sendEmail({
+            to: profile.email,
+            subject: 'LMS Onboarding and Account Information | Academy of Tech Masters',
+            html: welcomeHtml
         });
 
-        res.json({ success: true, message: 'Email sequence triggered via n8n' });
+        res.json({ success: true, message: 'Onboarding email sent successfully via SMTP' });
     } catch (err) {
-        console.error('[Admin Email Error]:', err.message);
-        if (err.response) {
-            console.error('[Admin Email Details]:', err.response.status, err.response.data);
-            // If n8n returns 404, it means the workflow is likely deactivated in n8n
-            if (err.response.status === 404) {
-                return res.status(404).json({
-                    error: 'Mail workflow is inactive or path incorrect in n8n.',
-                    details: 'Ensure n8n workflow is "ACTIVE" for production webhooks.'
-                });
-            }
-        }
         handleError(res, err, 'send-student-email');
     }
 });
@@ -2213,6 +2761,7 @@ app.get('/api/admin/users', authenticateToken, requireAdminOrManager, async (req
                 longitude: profile.longitude || null,
                 college_name: profile.college_name || null,
                 institute_name: profile.institute_name || null,
+                course_type: profile.course_type || 'full_time',
             };
         });
 
@@ -2307,7 +2856,7 @@ app.get('/api/admin/student-performance/:studentId', authenticateToken, requireA
             if (r.answers) {
                 try {
                     answersObj = Object.fromEntries(r.answers);
-                } catch(e) {
+                } catch (e) {
                     if (typeof r.answers === 'object') {
                         Object.entries(r.answers).forEach(([k, v]) => { answersObj[k] = String(v); });
                     }
@@ -2323,7 +2872,7 @@ app.get('/api/admin/student-performance/:studentId', authenticateToken, requireA
                 try {
                     const bankQs = await QuestionBank.find({ _id: { $in: qIds } }).lean();
                     bankQs.forEach(q => { bankMap[q._id.toString()] = q; });
-                } catch(e) {}
+                } catch (e) { }
             }
 
             // Helper: resolve answer value — if it's an option ObjectId, return the option text
@@ -2392,7 +2941,7 @@ app.get('/api/admin/student-performance/:studentId', authenticateToken, requireA
                                 student_answer: studentText
                             });
                         });
-                    } catch(e) {}
+                    } catch (e) { }
                 }
             }
 
@@ -2912,8 +3461,8 @@ app.get('/api/chat/contacts', authenticateToken, async (req, res) => {
         const role = await getUserRole(req.user.id);
         let contacts = [];
 
-        if (role?.toLowerCase() === 'student') {
-            // Students see instructors of courses they are enrolled in
+        if (role?.toLowerCase() === 'student' || role?.toLowerCase() === 'intern') {
+            // Students and interns see instructors of courses they are enrolled in
             const enrollments = await Enrollment.find({
                 user_id: req.user.id,
                 status: 'active'
@@ -3250,7 +3799,7 @@ app.post('/api/instructor/register', upload.single('resume'), async (req, res) =
     const { email, password, fullName, areaOfExpertise, customExpertise, experience } = req.body;
     try {
         // Reuse Signup Logic (Partial)
-        const salt = await bcrypt.genSalt(10);
+        const salt = await bcrypt.genSalt(12);
         const passwordHash = await bcrypt.hash(password, salt);
 
         let user = await User.findOne({ email });
@@ -3837,7 +4386,7 @@ app.get('/api/student/video-progress/:courseId', authenticateToken, async (req, 
         const { courseId } = req.params;
 
         const progressList = await VideoProgress.find({ user_id: userId, course_id: courseId }).lean();
-        
+
         // Map to expected format: { video_id, watched_seconds, total_seconds, completed }
         const mappedList = progressList.map(p => ({
             video_id: p.video_id,
@@ -4807,6 +5356,19 @@ app.get('/api/student/exam-questions/:id', authenticateToken, async (req, res) =
             type: q.type,
             question_type: q.type,
             language: q.language || 'python',
+            difficulty: q.difficulty || 'medium',
+            input_format: q.input_format,
+            output_format: q.output_format,
+            explanation: q.explanation,
+            constraints: q.constraints,
+            sample_input: q.sample_input,
+            sample_output: q.sample_output,
+            test_cases: (q.test_cases || []).map(tc => ({
+                input: tc.input,
+                expected_output: tc.expected_output,
+                explanation: tc.explanation,
+                is_hidden: tc.is_hidden
+            })),
             options: (q.options || []).map(opt => ({ id: opt._id || Math.random(), text: typeof opt === 'string' ? opt : opt.text })),
             // Do NOT send is_correct to frontend during exam
             marks: q.marks || 1
@@ -5981,8 +6543,10 @@ app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
 
 app.get('/api/admin/students', authenticateToken, requireAdminOrManager, async (req, res) => {
     try {
-        const studentRoles = await UserRole.find({ role: 'student' }).select('user_id');
+        // Include both students AND interns
+        const studentRoles = await UserRole.find({ role: { $in: ['student', 'intern'] } }).select('user_id role');
         const studentIds = studentRoles.map(r => r.user_id);
+        const roleMap = studentRoles.reduce((acc, r) => { acc[r.user_id.toString()] = r.role; return acc; }, {});
 
         const students = await User.aggregate([
             { $match: { _id: { $in: studentIds } } },
@@ -6001,18 +6565,17 @@ app.get('/api/admin/students', authenticateToken, requireAdminOrManager, async (
                     user_id: '$_id',
                     full_name: 1,
                     email: 1,
-                    // avatar_url: check profile first (Cloudinary upload), then User model
                     avatar_url: { $ifNull: ['$profile.avatar_url', '$avatar_url'] },
                     phone: 1,
                     last_login_at: 1,
                     registration_date: 1,
                     registration_time: 1,
                     created_at: 1,
-                    role: { $literal: 'student' },
-                    // All profile fields needed by Academic Scores
+                    // Do NOT hardcode role — look it up dynamically below
                     mobile_number: '$profile.mobile_number',
                     college_name: '$profile.college_name',
                     institute_name: '$profile.institute_name',
+                    course_type: { $ifNull: ['$profile.course_type', 'full_time'] },
                     full_address: '$profile.full_address',
                     city: '$profile.city',
                     district: '$profile.district',
@@ -6028,7 +6591,13 @@ app.get('/api/admin/students', authenticateToken, requireAdminOrManager, async (
             { $sort: { created_at: -1 } }
         ]);
 
-        res.json(students);
+        // Attach correct role from roleMap
+        const result = students.map(s => ({
+            ...s,
+            role: roleMap[s.user_id.toString()] || (s.course_type === 'internship' ? 'intern' : 'student'),
+        }));
+
+        res.json(result);
     } catch (err) {
         handleError(res, err, 'get-admin-students');
     }
@@ -6182,24 +6751,45 @@ app.get('/api/data/:table', authenticateToken, async (req, res) => {
                     const batchFilter = {
                         $or: [
                             // 1. Explicitly allowed for these specific batch IDs (handles both String and ObjectId saved forms)
-                            { allowed_batches: { $in: [
-                                ...studentBatchIds.map(id => mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id),
-                                ...studentBatchIds // also include string forms since Schema.Types.Mixed saves as strings
-                            ] } },
+                            {
+                                allowed_batches: {
+                                    $in: [
+                                        ...studentBatchIds.map(id => mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id),
+                                        ...studentBatchIds // also include string forms since Schema.Types.Mixed saves as strings
+                                    ]
+                                }
+                            },
 
                             // 2. Matches both session type AND the instructor assigned to the student
+                            //    IMPORTANT: only applies when NO specific batch was chosen (allowed_batches empty),
+                            //    otherwise a same-session/same-instructor video leaks across different specific batches.
                             {
                                 $and: [
                                     { batch_type: { $in: studentBatchTypes } },
-                                    { instructor_id: { $in: studentInstructors } }
+                                    { instructor_id: { $in: studentInstructors } },
+                                    {
+                                        $or: [
+                                            { allowed_batches: { $size: 0 } },
+                                            { allowed_batches: { $exists: false } },
+                                            { allowed_batches: null }
+                                        ]
+                                    }
                                 ]
                             },
 
                             // 3. (Optional) Legacy support: if no instructor_id is set yet, fallback to batch_type alone
+                            //    Also only when no specific batch was chosen, for the same reason as above.
                             {
                                 $and: [
                                     { instructor_id: { $exists: false } },
-                                    { batch_type: { $in: studentBatchTypes } }
+                                    { batch_type: { $in: studentBatchTypes } },
+                                    {
+                                        $or: [
+                                            { allowed_batches: { $size: 0 } },
+                                            { allowed_batches: { $exists: false } },
+                                            { allowed_batches: null }
+                                        ]
+                                    }
                                 ]
                             },
 
@@ -6236,7 +6826,7 @@ app.get('/api/data/:table', authenticateToken, async (req, res) => {
                 // Day N             → release_day 1..N ✅
                 // Future            → release_day > N ❌ (locked)
                 if (table === 'course_videos') {
-                    const queriedCourseId = query['course_id'] 
+                    const queriedCourseId = query['course_id']
                         || (query['$and'] && query['$and'].find(q => q['course_id'])?.['course_id']);
 
                     let enrolledAt = null;
@@ -7956,4 +8546,11 @@ httpServer.listen(port, () => {
     console.log(`[System] Auto-restart triggered at ${new Date().toISOString()}`);
 });
 
-// Trigger nodemon restart
+// ── Global Process Safety Handlers (Prevents Server Crashes) ──
+process.on('uncaughtException', (err) => {
+    console.error('[CRITICAL] Uncaught Exception caught to prevent crash:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[CRITICAL] Unhandled Promise Rejection caught to prevent crash:', reason);
+});
