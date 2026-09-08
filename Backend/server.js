@@ -1110,7 +1110,10 @@ const triggerOtpWebhook = async ({ email, full_name, otp }) => {
             console.log(`[AUTH-OTP Webhook Fallback] Successfully delivered OTP via n8n (${altUrl}) for ${email}:`, altResponse.data);
             return true;
         } catch (fallbackErr) {
-            console.error(`[AUTH-OTP Webhook Error]: All n8n URL attempts failed (${err.message} / ${fallbackErr.message}). Falling back to SMTP...`);
+            console.error(`[AUTH-OTP Webhook Error]: n8n Webhook failed (${err.message} / ${fallbackErr.message}).`);
+            
+            // ── Brevo SMTP Fallback Disabled (Uncomment below to re-enable Brevo SMTP if needed) ──
+            /*
             const otpHtml = `
                 <div style="font-family: 'Outfit', 'Inter', sans-serif; max-width: 500px; margin: 0 auto; padding: 24px; border-radius: 16px; background: #ffffff; border: 1px solid #e2e8f0;">
                     <h2 style="color: #0f172a;">Academy of Tech Masters</h2>
@@ -1124,6 +1127,7 @@ const triggerOtpWebhook = async ({ email, full_name, otp }) => {
                 subject: `🎉 Email Verification OTP: ${otp} | Academy of Tech Masters`,
                 html: otpHtml
             });
+            */
             return false;
         }
     }
@@ -5352,6 +5356,19 @@ app.get('/api/student/exam-questions/:id', authenticateToken, async (req, res) =
             type: q.type,
             question_type: q.type,
             language: q.language || 'python',
+            difficulty: q.difficulty || 'medium',
+            input_format: q.input_format,
+            output_format: q.output_format,
+            explanation: q.explanation,
+            constraints: q.constraints,
+            sample_input: q.sample_input,
+            sample_output: q.sample_output,
+            test_cases: (q.test_cases || []).map(tc => ({
+                input: tc.input,
+                expected_output: tc.expected_output,
+                explanation: tc.explanation,
+                is_hidden: tc.is_hidden
+            })),
             options: (q.options || []).map(opt => ({ id: opt._id || Math.random(), text: typeof opt === 'string' ? opt : opt.text })),
             // Do NOT send is_correct to frontend during exam
             marks: q.marks || 1
@@ -8529,4 +8546,11 @@ httpServer.listen(port, () => {
     console.log(`[System] Auto-restart triggered at ${new Date().toISOString()}`);
 });
 
-// Trigger nodemon restart
+// ── Global Process Safety Handlers (Prevents Server Crashes) ──
+process.on('uncaughtException', (err) => {
+    console.error('[CRITICAL] Uncaught Exception caught to prevent crash:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[CRITICAL] Unhandled Promise Rejection caught to prevent crash:', reason);
+});
