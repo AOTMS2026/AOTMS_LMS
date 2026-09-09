@@ -146,6 +146,7 @@ interface CodePlaygroundProps {
   onRunCode?: (lang: string, code: string) => Promise<void>;
   isRunning?: boolean;
   readOnly?: boolean;
+  className?: string;
 }
 
 export const CodePlayground: React.FC<CodePlaygroundProps> = ({
@@ -156,6 +157,7 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
   onRunCode,
   isRunning = false,
   readOnly = false,
+  className,
 }) => {
   const [selectedLanguage, setSelectedLanguage] = useState<string>(() =>
     normalizeLanguageId(initialLanguage)
@@ -299,7 +301,8 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
         "flex flex-col w-full rounded-2xl border border-slate-800 bg-slate-950 overflow-hidden shadow-2xl transition-all duration-300",
         isFullScreen
           ? "fixed inset-0 z-[9999] rounded-none border-none p-2 bg-slate-950"
-          : "h-[620px] xl:h-[680px] min-h-[550px]"
+          : "h-[620px] xl:h-[680px] min-h-[550px]",
+        className
       )}
     >
       {/* Top Main Toolbar */}
