@@ -4,6 +4,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { useAuth } from "@/hooks/useAuth";
+import { API_URL, parseJsonResponse } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -28,6 +29,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ShieldCheck,
+  GraduationCap,
 } from "lucide-react";
 
 import logo from "@/assets/logo.png";
@@ -55,7 +57,7 @@ import {
 } from "@/components/ui/input-otp";
 
 
-const COLLEGES = [
+export const COLLEGES = [
   "3rd Year Loyola Institute of Technology and Management (LITAM)",
   "4th Year Loyola Institute of Technology and Management (LITAM)",
   "Velagapudi Ramakrishna Siddhartha Engineering College",
@@ -146,8 +148,11 @@ const detailsSchema = z
         message: "Password must contain at least one lowercase letter",
       })
       .regex(/[0-9]/, { message: "Password must contain at least one number" }),
-    collegeName: z.string().optional(),
-    instituteName: z.string().optional(),
+    collegeName: z
+      .string()
+      .min(2, { message: "Please enter your college name" })
+      .max(120, { message: "College name too long" }),
+    courseType: z.string().min(1, { message: "Please select a course type" }),
     confirmPassword: z
       .string()
       .min(1, { message: "Please confirm your password" }),
@@ -159,15 +164,6 @@ const detailsSchema = z
     message: "Passwords don't match",
     path: ["confirmPassword"],
   })
-  .refine(
-    (data) =>
-      (data.collegeName && data.collegeName.trim().length > 0) ||
-      (data.instituteName && data.instituteName.trim().length > 0),
-    {
-      message: "Please enter either your College or Institute Name",
-      path: ["collegeName"],
-    },
-  );
 
 type LoginFormData = z.infer<typeof loginSchema>;
 type EmailVerifyFormData = z.infer<typeof emailVerifySchema>;
@@ -211,7 +207,6 @@ export default function Auth() {
   );
   const [adminLoginEmail, setAdminLoginEmail] = useState("");
   const [adminOtpResendTimer, setAdminOtpResendTimer] = useState(0);
-  const [openCollege, setOpenCollege] = useState(false);
   const [openInstitute, setOpenInstitute] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   // ── Forgot Password State ──────────────────────────────────────────────────
@@ -283,7 +278,7 @@ export default function Auth() {
       password: "",
       confirmPassword: "",
       collegeName: "",
-      instituteName: "",
+      courseType: "",
       agreeToTerms: false,
     },
   });
@@ -321,8 +316,6 @@ export default function Auth() {
     }
   }, [forgotResendTimer]);
 
-  const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
-
   // ── Forgot Password Handlers ───────────────────────────────────────────────
   const handleForgotSendOtp = async () => {
     if (!forgotEmail.trim() || !/\S+@\S+\.\S+/.test(forgotEmail)) {
@@ -337,7 +330,7 @@ export default function Auth() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: forgotEmail })
       });
-      const data = await res.json();
+      const data = await parseJsonResponse<any>(res);
       if (!res.ok) throw new Error(data.error || 'Failed to send OTP');
 
       setForgotStep('otp');
@@ -364,7 +357,7 @@ export default function Auth() {
         body: JSON.stringify({ email: forgotEmail, otp: targetOtp })
       });
       if (!res.ok) {
-        const err = await res.json();
+        const err = await parseJsonResponse<any>(res);
         throw new Error(err.error || 'Invalid OTP');
       }
       setForgotStep('reset');
@@ -393,7 +386,7 @@ export default function Auth() {
         body: JSON.stringify({ email: forgotEmail, otp: forgotOtp, new_password: forgotNewPassword })
       });
       if (!res.ok) {
-        const err = await res.json();
+        const err = await parseJsonResponse<any>(res);
         throw new Error(err.error || 'Reset failed');
       }
       toast({ title: "Password Reset!", description: "Login with your new password." });
@@ -420,7 +413,7 @@ export default function Auth() {
         }),
       });
 
-      const result = await response.json();
+      const result = await parseJsonResponse<any>(response);
 
       if (response.ok) {
         setRegistrationStep("otp");
@@ -460,7 +453,7 @@ export default function Auth() {
         }),
       });
 
-      const result = await response.json();
+      const result = await parseJsonResponse<any>(response);
 
       if (response.ok) {
         setRegistrationStep("details");
@@ -504,7 +497,7 @@ export default function Auth() {
         }),
       });
 
-      const result = await response.json();
+      const result = await parseJsonResponse<any>(response);
 
       if (response.ok) {
         setOtpResendTimer(120);
@@ -615,8 +608,8 @@ export default function Auth() {
       data.password,
       tempUserData.fullName,
       fullPhone,
+      data.courseType,
       data.collegeName,
-      data.instituteName,
       locationData
     );
 
@@ -712,7 +705,7 @@ export default function Auth() {
           description: "A new OTP has been sent to your email.",
         });
       } else {
-        const result = await response.json();
+        const result = await parseJsonResponse<any>(response);
         toast({
           title: "Error",
           description: result.error || "Failed to resend OTP.",
@@ -1402,139 +1395,66 @@ export default function Auth() {
                         )}
                       />
 
-                      {/* College & Institute - Responsive Layout with (OR) */}
-                      <div className="flex flex-col sm:flex-row items-end gap-3 sm:gap-2 min-w-0 w-full">
-                        <FormField
-                          control={detailsForm.control}
-                          name="collegeName"
-                          render={({ field }) => (
-                            <FormItem className="flex flex-col flex-1 min-w-0">
-                              <FormLabel className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest ml-1 mb-1">
-                                College Name
-                              </FormLabel>
-                              <Popover open={openCollege} onOpenChange={setOpenCollege}>
-                                <PopoverTrigger asChild>
-                                  <FormControl>
-                                    <Button
-                                      variant="outline"
-                                      role="combobox"
-                                      className={cn(
-                                        "w-full h-11 justify-start bg-slate-50 border-slate-100 rounded-xl focus:ring-4 focus:ring-[#0075CF]/10 transition-all text-xs font-medium px-3 overflow-hidden min-w-0",
-                                        !field.value && "text-muted-foreground font-normal"
-                                      )}
-                                      onFocus={() => setIsTyping(true)}
-                                      onBlur={() => setIsTyping(false)}
-                                    >
-                                      <span className="truncate min-w-0 block">
-                                        {field.value
-                                          ? COLLEGES.find(
-                                              (college) => college === field.value
-                                            )
-                                          : "Please select your college .."}
-                                      </span>
-                                    </Button>
-                                  </FormControl>
-                                </PopoverTrigger>
-                                <PopoverContent className="w-[300px] p-0" align="start">
-                                  <Command>
-                                    <CommandInput placeholder="Search college..." />
-                                     <CommandList className="max-h-[200px] overflow-y-auto">
-                                      <CommandEmpty>No college found.</CommandEmpty>
-                                       <CommandGroup>
-                                        {COLLEGES.map((college) => (
-                                          <CommandItem
-                                            value={college}
-                                            key={college}
-                                            className="text-xs py-2 px-3 hover:bg-white hover:text-black data-[selected=true]:bg-white data-[selected=true]:text-black font-medium cursor-pointer transition-colors"
-                                            onSelect={() => {
-                                              detailsForm.setValue("collegeName", college);
-                                              setOpenCollege(false);
-                                            }}
-                                          >
-                                            <Check
-                                              className={cn(
-                                                "mr-2 h-3.5 w-3.5",
-                                                college === field.value
-                                                  ? "opacity-100"
-                                                  : "opacity-0"
-                                              )}
-                                            />
-                                            {college}
-                                          </CommandItem>
-                                        ))}
-                                       </CommandGroup>
-                                     </CommandList>
-                                  </Command>
-                                </PopoverContent>
-                              </Popover>
-                              <FormMessage className="text-[10px]" />
-                            </FormItem>
-                          )}
-                        />
+                      {/* College & Institute + Course Type */}
+                      <FormField
+                        control={detailsForm.control}
+                        name="collegeName"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest ml-1 mb-1">
+                              College / Institute Name
+                            </FormLabel>
+                            <FormControl>
+                              <div className="relative">
+                                <GraduationCap className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 z-10" />
+                                <Input
+                                  placeholder="e.g. KL University"
+                                  className="pl-10 h-11 bg-slate-50 border-slate-200 rounded-xl focus:ring-4 focus:ring-[#0075CF]/10 transition-all"
+                                  list="college-suggestions"
+                                  autoComplete="off"
+                                  onFocus={() => setIsTyping(true)}
+                                  onBlur={() => setIsTyping(false)}
+                                  {...field}
+                                />
+                                <datalist id="college-suggestions">
+                                  {COLLEGES.map((c) => (
+                                    <option key={c} value={c} />
+                                  ))}
+                                </datalist>
+                              </div>
+                            </FormControl>
+                            <FormMessage className="text-[10px]" />
+                          </FormItem>
+                        )}
+                      />
 
-                        <div className="flex items-center justify-center shrink-0 pb-3">
-                          <span className="text-[10px] font-black text-red-500 uppercase opacity-80">(OR)</span>
-                        </div>
-
-                        <FormField
-                          control={detailsForm.control}
-                          name="instituteName"
-                          render={({ field }) => (
-                            <FormItem className="flex flex-col flex-1 min-w-0">
-                              <FormLabel className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest ml-1 mb-1">
-                                Institute Name
-                              </FormLabel>
-                              <Popover open={openInstitute} onOpenChange={setOpenInstitute}>
-                                <PopoverTrigger asChild>
-                                  <FormControl>
-                                    <Button
-                                      variant="outline"
-                                      role="combobox"
-                                      className={cn(
-                                        "w-full h-11 justify-start bg-slate-50 border-slate-100 rounded-xl focus:ring-4 focus:ring-[#0075CF]/10 transition-all text-xs font-medium px-3 overflow-hidden min-w-0",
-                                        !field.value && "text-muted-foreground font-normal"
-                                      )}
-                                      onFocus={() => setIsTyping(true)}
-                                      onBlur={() => setIsTyping(false)}
-                                    >
-                                      <span className="truncate">
-                                        {field.value ? field.value : "Institute Name .."}
-                                      </span>
-                                    </Button>
-                                  </FormControl>
-                                </PopoverTrigger>
-                                <PopoverContent className="w-[200px] p-0" align="start">
-                                  <Command>
-                                    <CommandList>
-                                      <CommandGroup>
-                                        <CommandItem
-                                          value="AOTMS"
-                                          className="text-xs py-2 px-3 hover:bg-white hover:text-black data-[selected=true]:bg-white data-[selected=true]:text-black font-medium cursor-pointer transition-colors"
-                                          onSelect={() => {
-                                            detailsForm.setValue("instituteName", "AOTMS");
-                                            setOpenInstitute(false);
-                                          }}
-                                        >
-                                          <Check
-                                            className={cn(
-                                              "mr-2 h-3.5 w-3.5",
-                                              field.value === "AOTMS"
-                                                ? "opacity-100"
-                                                : "opacity-0"
-                                            )}
-                                          />
-                                          AOTMS
-                                        </CommandItem>
-                                      </CommandGroup>
-                                    </CommandList>
-                                  </Command>
-                                </PopoverContent>
-                              </Popover>
-                              <FormMessage className="text-[10px]" />
-                            </FormItem>
-                          )}
-                        />
-                      </div>
+                      {/* Course Type */}
+                      <FormField
+                        control={detailsForm.control}
+                        name="courseType"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest ml-1 mb-1">
+                              Course Type
+                            </FormLabel>
+                            <FormControl>
+                              <select
+                                value={field.value}
+                                onChange={field.onChange}
+                                onFocus={() => setIsTyping(true)}
+                                onBlur={() => setIsTyping(false)}
+                                className="w-full h-11 bg-slate-50 border border-slate-200 rounded-xl px-3 text-sm font-medium text-slate-900 focus:outline-none focus:ring-4 focus:ring-[#0075CF]/10 focus:border-[#0075CF] transition-all appearance-none cursor-pointer"
+                              >
+                                <option value="" disabled>Select your course type...</option>
+                                <option value="full_time">Full Time Course</option>
+                                <option value="internship">Internship</option>
+                                <option value="bridge">Bridge Course</option>
+                              </select>
+                            </FormControl>
+                            <FormMessage className="text-[10px]" />
+                          </FormItem>
+                        )}
+                      />
 
                       <FormField
                         control={detailsForm.control}

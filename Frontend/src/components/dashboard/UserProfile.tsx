@@ -1,4 +1,3 @@
-
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { Button } from '@/components/ui/button';
@@ -11,6 +10,8 @@ import { useToast } from '@/hooks/use-toast';
 import { Loader2, Save, Upload, Github, Briefcase, Copy, CheckCircle, ExternalLink, Linkedin } from 'lucide-react';
 import { Textarea } from '@/components/ui/textarea';
 import { useRef } from 'react';
+import { fetchWithAuth, API_URL } from '@/lib/api';
+import { COLLEGES } from '@/pages/Auth';
 
 interface ProfileData {
     id: string;
@@ -41,7 +42,6 @@ interface ProfileData {
     longitude?: number | null;
 }
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
 
 export function UserProfile() {
     const { user, userRole, checkSession } = useAuth();
@@ -83,17 +83,7 @@ export function UserProfile() {
     const fetchProfile = useCallback(async () => {
         try {
             if (!user) return;
-            const token = localStorage.getItem('access_token');
-            const res = await fetch(`${API_URL}/user/profile?t=${Date.now()}`, {
-                headers: { 
-                    Authorization: `Bearer ${token}`
-                },
-                cache: 'no-store'
-            });
-
-            if (!res.ok) throw new Error('Failed to fetch profile');
-
-            const result = await res.json();
+            const result = await fetchWithAuth<{ profile: any; user: any }>(`/user/profile?t=${Date.now()}`);
             const data = result.profile;
             const userData = result.user;
 
@@ -179,19 +169,10 @@ export function UserProfile() {
                 // mobile_number: profile.phone,
             };
 
-            const res = await fetch(`${API_URL}/user/profile`, {
+            await fetchWithAuth('/user/profile', {
                 method: 'PUT',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`
-                },
                 body: JSON.stringify(updates)
             });
-
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.error || 'Update failed');
-            }
 
             toast({
                 title: 'Success',
@@ -217,24 +198,13 @@ export function UserProfile() {
 
         setUploadingImage(true);
         try {
-            const token = localStorage.getItem('access_token');
             const formData = new FormData();
             formData.append('file', file);
 
-            const res = await fetch(`${API_URL}/user/profile/image`, {
+            const data = await fetchWithAuth<{ url?: string; path?: string; fileUrl?: string }>('/user/profile/image', {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${token}`
-                },
                 body: formData
             });
-
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.error || 'Upload failed');
-            }
-
-            const data = await res.json();
             
             const imageUrl = data.url || data.path || data.fileUrl;
             if (imageUrl) {
@@ -272,22 +242,14 @@ export function UserProfile() {
 
         setUploadingResume(true);
         try {
-            const token = localStorage.getItem('access_token');
-            const res = await fetch(`${API_URL}/s3/upload-url`, {
+            const { uploadUrl, fileName: s3Key } = await fetchWithAuth<{ uploadUrl: string; fileName: string }>('/s3/upload-url', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${token}`
-                },
                 body: JSON.stringify({
                     fileName: file.name,
                     fileType: file.type,
                     folder: `resumes/${profile.id || user?.id}`
                 })
             });
-
-            if (!res.ok) throw new Error('Failed to get upload URL');
-            const { uploadUrl, fileName: s3Key } = await res.json();
 
             const uploadRes = await fetch(uploadUrl, {
                 method: 'PUT',
@@ -413,10 +375,17 @@ export function UserProfile() {
                                     <Label htmlFor="collegeName">College Name</Label>
                                     <Input
                                         id="collegeName"
-                                        placeholder="e.g. DVR & DR.HS MIC COLLEGE OF TECHNOLOGY"
+                                        placeholder="e.g. Loyola Institute of Technology and Management (LITAM)"
                                         value={profile.college_name || ''}
+                                        autoComplete="off"
+                                        list="user-profile-college-suggestions"
                                         onChange={(e) => setProfile({ ...profile, college_name: e.target.value })}
                                     />
+                                    <datalist id="user-profile-college-suggestions">
+                                        {COLLEGES.map((c) => (
+                                            <option key={c} value={c} />
+                                        ))}
+                                    </datalist>
                                 </div>
                                 <div className="space-y-2">
                                     <Label htmlFor="instituteName">Company Name</Label>

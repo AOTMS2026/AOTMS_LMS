@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { fetchWithAuth } from "@/lib/api";
+import { COLLEGES } from "@/pages/Auth";
 import {
   Card,
   CardContent,
@@ -61,12 +62,18 @@ import {
   Zap,
   ShieldCheck,
   RefreshCw,
-  Trash2
+  Trash2,
+  ChevronDown,
+  ChevronUp,
+  Check,
+  X,
+  Phone
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { toast } from "sonner";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -128,7 +135,7 @@ interface UserManagementProps {
   ) => Promise<boolean>;
   onUpdateRole: (
     userId: string,
-    role: "admin" | "manager" | "instructor" | "student",
+    role: "admin" | "manager" | "instructor" | "student" | "intern",
   ) => Promise<boolean>;
   onSendEmail: (userId: string) => Promise<boolean>;
   onUpdateEnrollmentStatus?: (id: string, status: "rejected" | "active") => Promise<void>;
@@ -163,6 +170,317 @@ export function UserManagement({
   const [showSuspendDialog, setShowSuspendDialog] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [suspensionDays, setSuspensionDays] = useState("7");
+
+  // Bulk Approval States
+  const [showBulkApprovalDialog, setShowBulkApprovalDialog] = useState(false);
+  const [selectedPendingUserIds, setSelectedPendingUserIds] = useState<Set<string>>(new Set());
+  const [bulkSearchQuery, setBulkSearchQuery] = useState("");
+  const [bulkCollegeFilter, setBulkCollegeFilter] = useState("all");
+  const [bulkTargetRole, setBulkTargetRole] = useState("keep");
+  const [bulkTargetCourseType, setBulkTargetCourseType] = useState("keep");
+  const [bulkTargetCollege, setBulkTargetCollege] = useState("keep");
+  const [bulkTargetCourseProgramme, setBulkTargetCourseProgramme] = useState("keep");
+  const [bulkTargetBatch, setBulkTargetBatch] = useState("keep");
+  const [availableCourses, setAvailableCourses] = useState<{ id: string; title: string }[]>([]);
+  const [isBulkProcessing, setIsBulkProcessing] = useState(false);
+
+  // Edit Profile States
+  const [showEditProfileDialog, setShowEditProfileDialog] = useState(false);
+  const [editFullName, setEditFullName] = useState("");
+  const [editCollegeName, setEditCollegeName] = useState("");
+  const [editInstituteName, setEditInstituteName] = useState("");
+  const [editMobileNumber, setEditMobileNumber] = useState("");
+  const [editCourseType, setEditCourseType] = useState("full_time");
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
+
+  // Helper to open Edit Profile Dialog for any user
+  const openEditProfileForUser = (user: Profile) => {
+    setSelectedUser(user);
+    setEditFullName(user.full_name || "");
+    setEditCollegeName((user.college_name || (user as any).college_name || "").trim());
+    setEditInstituteName((user.institute_name || (user as any).institute_name || "").trim());
+    setEditMobileNumber((user.mobile_number || (user as any).phone || "").trim());
+    setEditCourseType((user.course_type || (user as any).course_type || "full_time"));
+    setIsCollegeDropdownOpen(false);
+    setShowEditProfileDialog(true);
+  };
+
+  // Pending users computation
+  const pendingUsers = useMemo(() => {
+    return users.filter(u => u.approval_status === 'pending' || u.status === 'pending');
+  }, [users]);
+
+  // Filtered pending users in bulk modal
+  const filteredPendingUsers = useMemo(() => {
+    return pendingUsers.filter(u => {
+      const q = bulkSearchQuery.trim().toLowerCase();
+      const matchesSearch = !q || (
+        (u.full_name || "").toLowerCase().includes(q) ||
+        (u.email || "").toLowerCase().includes(q) ||
+        (u.college_name || "").toLowerCase().includes(q) ||
+        (u.mobile_number || (u as any).phone || "").toLowerCase().includes(q)
+      );
+      const matchesCollege = bulkCollegeFilter === "all" || (u.college_name || "").trim() === bulkCollegeFilter.trim();
+      return matchesSearch && matchesCollege;
+    });
+  }, [pendingUsers, bulkSearchQuery, bulkCollegeFilter]);
+
+  // Unique colleges in pending list
+  const pendingColleges = useMemo(() => {
+    const set = new Set<string>();
+    pendingUsers.forEach(u => {
+      if (u.college_name && u.college_name.trim()) set.add(u.college_name.trim());
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  }, [pendingUsers]);
+
+  // Toggle selection for single user
+  const toggleSelectUser = (userId: string) => {
+    setSelectedPendingUserIds(prev => {
+      const next = new Set(prev);
+      if (next.has(userId)) next.delete(userId);
+      else next.add(userId);
+      return next;
+    });
+  };
+
+  // Toggle select all filtered users
+  const isAllFilteredSelected = filteredPendingUsers.length > 0 && filteredPendingUsers.every(u => selectedPendingUserIds.has(u.id));
+  const toggleSelectAllFiltered = () => {
+    if (isAllFilteredSelected) {
+      setSelectedPendingUserIds(prev => {
+        const next = new Set(prev);
+        filteredPendingUsers.forEach(u => next.delete(u.id));
+        return next;
+      });
+    } else {
+      setSelectedPendingUserIds(prev => {
+        const next = new Set(prev);
+        filteredPendingUsers.forEach(u => next.add(u.id));
+        return next;
+      });
+    }
+  };
+
+  // Fetch available courses list for bulk assignment
+  useEffect(() => {
+    fetchWithAuth<any[]>('/public/courses')
+      .then(data => {
+        if (Array.isArray(data)) {
+          setAvailableCourses(data.map(c => ({
+            id: c.id || c._id || c.slug,
+            title: c.title || c.name || "Untitled Course"
+          })));
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Automatic sync handlers for Bulk Select Options
+  const handleBulkCourseTypeChange = (val: string) => {
+    setBulkTargetCourseType(val);
+    if (val === "internship" || val === "internship_student") {
+      setBulkTargetRole("intern");
+    } else if (val === "full_time") {
+      setBulkTargetRole("student");
+    }
+  };
+
+  const handleBulkCourseProgrammeChange = (val: string) => {
+    setBulkTargetCourseProgramme(val);
+    if (val !== "keep") {
+      const lower = val.toLowerCase();
+      if (lower.includes("intern") || lower.includes("internship")) {
+        setBulkTargetCourseType("internship");
+        setBulkTargetRole("intern");
+      } else if (lower.includes("full") || lower.includes("student")) {
+        setBulkTargetCourseType("full_time");
+        setBulkTargetRole("student");
+      }
+    }
+  };
+
+  // Dynamic Batches list based on selected Course Programme
+  const availableBatches = useMemo(() => {
+    if (bulkTargetCourseProgramme !== "keep") {
+      return [
+        "keep",
+        `${bulkTargetCourseProgramme} - Batch A`,
+        `${bulkTargetCourseProgramme} - Batch B`,
+        "Batch 1 (Morning)",
+        "Batch 2 (Evening)",
+        "Weekend Batch",
+        "Fast-Track Batch"
+      ];
+    }
+    return [
+      "keep",
+      "Batch 1 (Morning)",
+      "Batch 2 (Evening)",
+      "2026 Batch A",
+      "2026 Batch B",
+      "Weekend Batch",
+      "Fast-Track Internship Batch"
+    ];
+  }, [bulkTargetCourseProgramme]);
+
+  // Bulk Approve / Reject handler
+  const handleBulkApprove = async (targetStatus: "approved" | "rejected" = "approved") => {
+    if (selectedPendingUserIds.size === 0) {
+      toast.error("Please select at least one user to proceed.");
+      return;
+    }
+    const ids = Array.from(selectedPendingUserIds);
+    setIsBulkProcessing(true);
+    try {
+      const body: any = {
+        userIds: ids,
+        status: targetStatus
+      };
+      if (bulkTargetRole !== "keep") {
+        body.role = bulkTargetRole;
+      }
+      if (bulkTargetCourseType !== "keep") {
+        body.course_type = bulkTargetCourseType;
+      }
+      if (bulkTargetCollege !== "keep") {
+        body.college_name = bulkTargetCollege;
+      }
+      if (bulkTargetCourseProgramme !== "keep") {
+        body.course_title = bulkTargetCourseProgramme;
+      }
+      if (bulkTargetBatch !== "keep") {
+        body.batch_name = bulkTargetBatch;
+      }
+
+      await fetchWithAuth('/admin/bulk-update-user-status', {
+        method: 'PUT',
+        body: JSON.stringify(body)
+      });
+
+      toast.success(`Successfully ${targetStatus === 'approved' ? 'approved' : 'rejected'} ${ids.length} users!`);
+
+      // Optimistically update local state
+      ids.forEach(id => {
+        const u = users.find(x => x.id === id);
+        if (u) {
+          u.approval_status = targetStatus;
+          if (bulkTargetRole !== "keep") u.role = bulkTargetRole as any;
+          if (bulkTargetCourseType !== "keep") u.course_type = bulkTargetCourseType;
+          if (bulkTargetCollege !== "keep") u.college_name = bulkTargetCollege;
+        }
+      });
+
+      setSelectedPendingUserIds(new Set());
+      setShowBulkApprovalDialog(false);
+      if (onSync) onSync();
+    } catch (err: any) {
+      try {
+        for (const id of ids) {
+          await onUpdateStatus(id, targetStatus);
+        }
+        toast.success(`Updated ${ids.length} users successfully!`);
+        setSelectedPendingUserIds(new Set());
+        setShowBulkApprovalDialog(false);
+        if (onSync) onSync();
+      } catch (e: any) {
+        toast.error(err.message || 'Bulk status update failed');
+      }
+    } finally {
+      setIsBulkProcessing(false);
+    }
+  };
+
+  // College Dropdown States
+  const [isCollegeDropdownOpen, setIsCollegeDropdownOpen] = useState(false);
+  const collegeDropdownRef = useRef<HTMLDivElement>(null);
+  const [serverColleges, setServerColleges] = useState<string[]>([]);
+
+  // Fetch registered & profile colleges from backend as well
+  useEffect(() => {
+    fetchWithAuth<string[]>('/admin/colleges-list')
+      .then(data => {
+        if (Array.isArray(data)) setServerColleges(data);
+      })
+      .catch(() => {
+        // Fallback silently if endpoint not available
+      });
+  }, []);
+
+  // Close college dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        collegeDropdownRef.current &&
+        !collegeDropdownRef.current.contains(event.target as Node)
+      ) {
+        setIsCollegeDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, []);
+
+  // Strict College list: COLLEGES array from Auth.tsx only
+  const allCollegeList = useMemo(() => {
+    const set = new Set<string>();
+    COLLEGES.forEach(c => {
+      if (c && c.trim()) set.add(c.trim());
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  }, []);
+
+  // Filtered colleges for combobox dropdown
+  const filteredColleges = useMemo(() => {
+    const term = editCollegeName.trim().toLowerCase();
+    if (!term) return allCollegeList;
+    return allCollegeList.filter(c => c.toLowerCase().includes(term));
+  }, [allCollegeList, editCollegeName]);
+
+  const handleSaveProfileDetails = async () => {
+    if (!selectedUser) return;
+    setIsSavingProfile(true);
+    try {
+      await fetchWithAuth('/admin/update-user-profile', {
+        method: 'PUT',
+        body: JSON.stringify({
+          userId: selectedUser.id,
+          full_name: editFullName.trim(),
+          college_name: editCollegeName.trim(),
+          institute_name: editInstituteName.trim(),
+          mobile_number: editMobileNumber.trim(),
+          course_type: editCourseType,
+        }),
+      });
+      toast.success('User profile & college details updated successfully!');
+      
+      // Update local object immediately
+      selectedUser.full_name = editFullName.trim();
+      selectedUser.college_name = editCollegeName.trim();
+      selectedUser.institute_name = editInstituteName.trim();
+      selectedUser.mobile_number = editMobileNumber.trim();
+      selectedUser.course_type = editCourseType;
+
+      const targetUser = users.find(u => u.id === selectedUser.id);
+      if (targetUser) {
+        targetUser.full_name = editFullName.trim();
+        targetUser.college_name = editCollegeName.trim();
+        targetUser.institute_name = editInstituteName.trim();
+        targetUser.mobile_number = editMobileNumber.trim();
+        targetUser.course_type = editCourseType;
+      }
+
+      setShowEditProfileDialog(false);
+      setIsCollegeDropdownOpen(false);
+      if (onSync) onSync();
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to update user profile details');
+    } finally {
+      setIsSavingProfile(false);
+    }
+  };
   
   interface PendingEnrollment {
     id: string;
@@ -349,9 +667,13 @@ export function UserManagement({
   };
 
   const filteredUsers = users.filter((user) => {
+    const q = searchQuery.toLowerCase().trim();
     const matchesSearch =
-      user.full_name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      user.email?.toLowerCase().includes(searchQuery.toLowerCase());
+      !q ||
+      user.full_name?.toLowerCase().includes(q) ||
+      user.email?.toLowerCase().includes(q) ||
+      user.college_name?.toLowerCase().includes(q) ||
+      user.institute_name?.toLowerCase().includes(q);
     const matchesRole = roleFilter === "all" || user.role === roleFilter;
     return matchesSearch && matchesRole;
   });
@@ -360,7 +682,7 @@ export function UserManagement({
     if (selectedUser && newRole) {
       await onUpdateRole(
         selectedUser.id,
-        newRole as "admin" | "manager" | "instructor" | "student",
+        newRole as "admin" | "manager" | "instructor" | "student" | "intern",
       );
       setShowRoleDialog(false);
       setSelectedUser(null);
@@ -458,8 +780,28 @@ export function UserManagement({
                   <SelectItem value="manager" className="text-xs font-bold py-2">MANAGERS</SelectItem>
                   <SelectItem value="instructor" className="text-xs font-bold py-2">INSTRUCTORS</SelectItem>
                   <SelectItem value="student" className="text-xs font-bold py-2">STUDENTS</SelectItem>
+                  <SelectItem value="intern" className="text-xs font-bold py-2">INTERNS</SelectItem>
                 </SelectContent>
               </Select>
+
+              {/* Bulk Approval Button */}
+              <Button
+                type="button"
+                onClick={() => {
+                  const pIds = users.filter(u => u.approval_status === 'pending' || u.status === 'pending').map(u => u.id);
+                  setSelectedPendingUserIds(new Set(pIds));
+                  setShowBulkApprovalDialog(true);
+                }}
+                className="h-10 px-4 rounded-xl font-bold text-xs uppercase tracking-tight bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 text-white shadow-md shadow-amber-500/20 flex items-center gap-2 transition-all active:scale-95 shrink-0"
+              >
+                <ShieldCheck className="h-4 w-4" />
+                <span>Bulk Approval</span>
+                {pendingUsers.length > 0 && (
+                  <span className="bg-white text-orange-600 font-black px-1.5 py-0.5 text-[10px] rounded-full leading-none shadow-sm">
+                    {pendingUsers.length}
+                  </span>
+                )}
+              </Button>
 
               {onSync && (
                 <div className="flex items-center gap-2">
@@ -517,15 +859,34 @@ export function UserManagement({
                         </p>
                         <Badge
                           variant="outline"
-                          className="shrink-0 text-[10px] h-6 px-2.5 rounded-lg uppercase font-black tracking-tight border border-slate-100 bg-slate-50 text-slate-900 shadow-sm"
+                          className={`shrink-0 text-[10px] h-6 px-2.5 rounded-lg uppercase font-black tracking-tight border shadow-sm ${
+                            user.role === 'intern'
+                              ? 'border-amber-200 bg-amber-50 text-amber-800'
+                              : user.role === 'student'
+                              ? 'border-blue-100 bg-blue-50 text-blue-900'
+                              : 'border-slate-100 bg-slate-50 text-slate-900'
+                          }`}
                         >
-                          {user.role || "student"}
+                          {user.role === 'intern' ? '🎓 Intern' : user.role || "student"}
                         </Badge>
                       </div>
                       <p className="text-xs text-slate-500 font-bold truncate flex items-center gap-2">
-                        <Mail className="h-3 w-3 opacity-40" />
-                        {user.email}
+                        <Mail className="h-3 w-3 opacity-40 shrink-0" />
+                        <span className="truncate">{user.email}</span>
                       </p>
+
+                      {/* ── User College (Small Size) ── */}
+                      <div className="flex items-center gap-1.5 text-[11px] text-slate-600 font-medium truncate pt-0.5" title={user.college_name || "No College Assigned"}>
+                        <GraduationCap className="h-3.5 w-3.5 shrink-0 text-indigo-500" />
+                        <span className="truncate">
+                          {user.college_name && user.college_name.trim() ? (
+                            <span className="font-semibold text-slate-700">{user.college_name.trim()}</span>
+                          ) : (
+                            <span className="text-slate-400 italic font-normal text-[10px]">No College Assigned</span>
+                          )}
+                        </span>
+                      </div>
+
                       <div className="flex items-center gap-2 pt-1">
                          <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest bg-slate-50 px-2 py-0.5 rounded-md border border-slate-100/50">
                            {formatLastActive(user.last_active_at)}
@@ -591,6 +952,9 @@ export function UserManagement({
                             )}
                             Send Notification Mail
                           </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => openEditProfileForUser(user)} className="rounded-xl font-bold text-[13px] py-2.5 cursor-pointer hover:bg-slate-50 text-slate-700">
+                            <Edit className="mr-3 h-4 w-4 text-indigo-500" /> Edit Profile & College
+                          </DropdownMenuItem>
                           <DropdownMenuItem onClick={() => {
                             setSelectedUser(user);
                             setNewRole(user.role || "student");
@@ -653,31 +1017,31 @@ export function UserManagement({
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
           {[
-            { label: "Students", count: roleCounts.student || 0, color: "bg-slate-900", icon: Users, desc: "Registered student profiles" },
-            { label: "Instructors", count: roleCounts.instructor || 0, color: "bg-blue-600", icon: Presentation, desc: "Course & content management" },
-            { label: "Managers", count: roleCounts.manager || 0, color: "bg-amber-500", icon: UserCog, desc: "Operational management team" },
-            { label: "Admins", count: roleCounts.admin || 0, color: "bg-rose-500", icon: Shield, desc: "Full system security access", isHigh: true },
+            { label: "Students",    count: roleCounts.student    || 0, icon: Users,        desc: "Full-time registered students",     accent: "bg-blue-50",   iconColor: "text-blue-600" },
+            { label: "Interns",     count: roleCounts.intern     || 0, icon: Briefcase,    desc: "Internship programme students",     accent: "bg-amber-50",  iconColor: "text-amber-600" },
+            { label: "Instructors", count: roleCounts.instructor || 0, icon: Presentation, desc: "Course & content management",       accent: "bg-emerald-50",iconColor: "text-emerald-600" },
+            { label: "Managers",    count: roleCounts.manager    || 0, icon: UserCog,      desc: "Operational management team",       accent: "bg-purple-50", iconColor: "text-purple-600" },
           ].map((role) => (
-            <Card key={role.label} className={`border-none shadow-xl shadow-slate-200/50 rounded-[2rem] overflow-hidden group transition-all duration-500 hover:-translate-y-2 ${role.isHigh ? 'bg-primary shadow-primary/30' : 'bg-white'}`}>
+            <Card key={role.label} className="border-none shadow-xl shadow-slate-200/50 rounded-[2rem] overflow-hidden group transition-all duration-500 hover:-translate-y-2 bg-white">
               <CardContent className="p-8">
                 <div className="flex justify-between items-start mb-8">
-                  <div className={`h-12 w-12 rounded-2xl flex items-center justify-center shadow-lg transition-transform duration-500 group-hover:rotate-12 ${role.isHigh ? 'bg-white/20' : 'bg-slate-50'}`}>
-                    <role.icon className={`h-6 w-6 ${role.isHigh ? 'text-white' : 'text-slate-600'}`} />
+                  <div className={`h-12 w-12 rounded-2xl flex items-center justify-center shadow-lg transition-transform duration-500 group-hover:rotate-12 ${role.accent}`}>
+                    <role.icon className={`h-6 w-6 ${role.iconColor}`} />
                   </div>
-                  <div className={`h-2 w-2 rounded-full animate-ping ${role.isHigh ? 'bg-white/40' : 'bg-emerald-500/40'}`} />
+                  <div className="h-2 w-2 rounded-full animate-ping bg-emerald-500/40" />
                 </div>
                 
                 <div className="space-y-1">
-                  <h5 className={`text-[10px] font-black uppercase tracking-[0.2em] ${role.isHigh ? 'text-white/90' : 'text-slate-900'}`}>
+                  <h5 className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-900">
                     {role.label}
                   </h5>
                   <div className="flex items-baseline gap-2">
-                    <span className={`text-3xl font-black tracking-tighter ${role.isHigh ? 'text-white' : 'text-slate-900'}`}>
+                    <span className="text-3xl font-black tracking-tighter text-slate-900">
                       {role.count}
                     </span>
-                    <span className={`text-[11px] font-bold ${role.isHigh ? 'text-white/70' : 'text-slate-900'}`}>Users</span>
+                    <span className="text-[11px] font-bold text-slate-500">Users</span>
                   </div>
-                  <p className={`text-[11px] font-medium pt-3 border-t mt-4 border-white/10 ${role.isHigh ? 'text-white/90' : 'text-slate-900 border-slate-50'}`}>
+                  <p className="text-[11px] font-medium pt-3 border-t mt-4 border-slate-50 text-slate-500">
                     {role.desc}
                   </p>
                 </div>
@@ -718,7 +1082,13 @@ export function UserManagement({
                     value="student"
                     className="rounded-lg h-10 font-medium hover:bg-slate-50"
                   >
-                    Student
+                    Student (Full-Time)
+                  </SelectItem>
+                  <SelectItem
+                    value="intern"
+                    className="rounded-lg h-10 font-medium hover:bg-slate-50"
+                  >
+                    Intern (Internship)
                   </SelectItem>
                   <SelectItem
                     value="instructor"
@@ -749,6 +1119,226 @@ export function UserManagement({
               onClick={handleRoleChange}
             >
               Update Role
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit User Profile Dialog */}
+      <Dialog open={showEditProfileDialog} onOpenChange={setShowEditProfileDialog}>
+        <DialogContent aria-describedby="edit-profile-dialog-description" className="max-w-lg overflow-hidden bg-white/95 backdrop-blur-2xl border border-slate-200/60 shadow-2xl rounded-3xl p-0">
+          <DialogHeader className="px-6 py-5 border-b border-slate-100 bg-slate-50/50">
+            <DialogTitle className="flex items-center gap-3 text-lg font-bold text-slate-800">
+              <div className="h-10 w-10 rounded-xl bg-indigo-50 flex items-center justify-center shadow-inner">
+                <Edit className="h-5 w-5 text-indigo-600" />
+              </div>
+              Edit Profile & College Details
+            </DialogTitle>
+            <DialogDescription id="edit-profile-dialog-description" className="text-sm text-slate-500 font-medium sm:ml-13">
+              Update credentials and registration info for <span className="text-slate-900 font-bold">{selectedUser?.full_name || selectedUser?.email}</span>
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto">
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Full Name</label>
+              <Input
+                value={editFullName}
+                onChange={(e) => setEditFullName(e.target.value)}
+                placeholder="Student Full Name"
+                className="h-11 rounded-xl font-bold text-slate-800"
+              />
+            </div>
+
+            <div className="space-y-1.5 relative" ref={collegeDropdownRef}>
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] font-black uppercase text-indigo-600 tracking-wider flex items-center gap-1">
+                  <GraduationCap className="h-3.5 w-3.5 text-indigo-500" /> College Name
+                </label>
+                {editCollegeName && (
+                  <span className="text-[10px] text-slate-400 font-semibold truncate max-w-[200px]" title={editCollegeName}>
+                    Selected: {editCollegeName}
+                  </span>
+                )}
+              </div>
+
+              <div className="relative">
+                <Input
+                  value={editCollegeName}
+                  onChange={(e) => {
+                    setEditCollegeName(e.target.value);
+                    setIsCollegeDropdownOpen(true);
+                  }}
+                  onFocus={() => setIsCollegeDropdownOpen(true)}
+                  onClick={() => setIsCollegeDropdownOpen(true)}
+                  placeholder="Click to select or search college..."
+                  autoComplete="off"
+                  className="h-11 rounded-xl font-bold text-slate-800 border-indigo-200 bg-indigo-50/20 pr-16 focus:border-indigo-500 focus:ring-indigo-500/20 cursor-pointer"
+                />
+                <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-0.5">
+                  {editCollegeName && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditCollegeName("");
+                        setIsCollegeDropdownOpen(true);
+                      }}
+                      title="Clear college"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-indigo-500 hover:text-indigo-700 hover:bg-indigo-50 rounded-lg"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setIsCollegeDropdownOpen(!isCollegeDropdownOpen);
+                    }}
+                    title={isCollegeDropdownOpen ? "Close dropdown" : "Show all colleges"}
+                  >
+                    {isCollegeDropdownOpen ? (
+                      <ChevronUp className="h-4 w-4" />
+                    ) : (
+                      <ChevronDown className="h-4 w-4" />
+                    )}
+                  </Button>
+                </div>
+              </div>
+
+              {/* College Dropdown List */}
+              {isCollegeDropdownOpen && (
+                <div className="absolute z-50 left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+                  <div className="p-2.5 border-b border-slate-100 bg-slate-50/80 flex items-center justify-between text-[11px] font-bold text-slate-600">
+                    <span className="flex items-center gap-1.5">
+                      <GraduationCap className="h-3.5 w-3.5 text-indigo-500" />
+                      All Colleges List ({filteredColleges.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setIsCollegeDropdownOpen(false)}
+                      className="text-[10px] text-indigo-600 hover:underline cursor-pointer font-bold"
+                    >
+                      Done
+                    </button>
+                  </div>
+
+                  <div className="max-h-52 overflow-y-auto divide-y divide-slate-50 p-1.5">
+                    {/* Custom typed option if not in list */}
+                    {editCollegeName.trim() &&
+                      !allCollegeList.some(
+                        (c) => c.toLowerCase() === editCollegeName.trim().toLowerCase()
+                      ) && (
+                        <div
+                          onClick={() => {
+                            setIsCollegeDropdownOpen(false);
+                          }}
+                          className="p-2.5 rounded-xl hover:bg-indigo-50 cursor-pointer flex items-center justify-between text-xs text-indigo-700 font-semibold bg-indigo-50/40 border border-indigo-100 mb-1"
+                        >
+                          <span className="truncate">
+                            ✨ Keep custom: <strong className="text-indigo-900">"{editCollegeName.trim()}"</strong>
+                          </span>
+                          <Badge variant="outline" className="text-[9px] border-indigo-200 text-indigo-600 shrink-0">
+                            Custom
+                          </Badge>
+                        </div>
+                      )}
+
+                    {filteredColleges.length === 0 ? (
+                      <div className="p-4 text-center text-xs text-slate-400 font-medium">
+                        No matching colleges in list. Custom entry will be saved.
+                      </div>
+                    ) : (
+                      filteredColleges.map((college) => {
+                        const isSelected =
+                          editCollegeName.trim().toLowerCase() ===
+                          college.trim().toLowerCase();
+                        return (
+                          <div
+                            key={college}
+                            onClick={() => {
+                              setEditCollegeName(college);
+                              setIsCollegeDropdownOpen(false);
+                            }}
+                            className={`p-2.5 rounded-xl cursor-pointer flex items-center justify-between text-xs transition-colors ${
+                              isSelected
+                                ? "bg-indigo-50 text-indigo-900 font-bold"
+                                : "text-slate-700 hover:bg-slate-50 font-medium"
+                            }`}
+                          >
+                            <span className="truncate pr-2">{college}</span>
+                            {isSelected && (
+                              <Check className="h-4 w-4 text-indigo-600 shrink-0" />
+                            )}
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Institute Name (Branch / Department)</label>
+              <Input
+                value={editInstituteName}
+                onChange={(e) => setEditInstituteName(e.target.value)}
+                placeholder="e.g. Computer Science Engineering"
+                className="h-11 rounded-xl font-medium text-slate-800"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Mobile Number</label>
+                <Input
+                  value={editMobileNumber}
+                  onChange={(e) => setEditMobileNumber(e.target.value)}
+                  placeholder="+91 9876543210"
+                  className="h-11 rounded-xl font-medium text-slate-800"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Course Programme</label>
+                <Select value={editCourseType} onValueChange={setEditCourseType}>
+                  <SelectTrigger className="h-11 rounded-xl font-bold text-slate-800 border-slate-200">
+                    <SelectValue placeholder="Course Type" />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-xl border-slate-200 shadow-xl">
+                    <SelectItem value="full_time" className="font-bold text-xs">Full-Time Student</SelectItem>
+                    <SelectItem value="internship" className="font-bold text-xs">Internship Student</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter className="px-6 py-4 border-t border-slate-100 bg-slate-50/50 flex gap-3">
+            <Button
+              variant="ghost"
+              className="rounded-xl font-semibold text-slate-600 hover:bg-slate-200/50 h-11 px-6"
+              onClick={() => setShowEditProfileDialog(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              disabled={isSavingProfile}
+              onClick={handleSaveProfileDetails}
+              className="rounded-xl font-bold bg-primary text-white shadow-lg shadow-primary/20 h-11 px-8 gap-2"
+            >
+              {isSavingProfile ? (
+                <><Loader2 className="h-4 w-4 animate-spin" /> Saving...</>
+              ) : (
+                'Save Changes'
+              )}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1254,6 +1844,23 @@ export function UserManagement({
                   Change Role
                 </Button>
 
+                {/* Dashboard Access Button — routes based on role */}
+                {(selectedUser.role === 'student' || selectedUser.role === 'intern') && (
+                  <a
+                    href={selectedUser.role === 'intern' ? '/intern-dashboard' : '/student-dashboard'}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex-1"
+                  >
+                    <Button variant="outline" className={`w-full ${selectedUser.role === 'intern' ? 'border-amber-200 text-amber-700 hover:bg-amber-50' : 'border-blue-200 text-blue-700 hover:bg-blue-50'}`}>
+                      <ExternalLink className="h-4 w-4 mr-2" />
+                      {selectedUser.role === 'intern' ? 'Intern Dashboard' : 'Student Dashboard'}
+                    </Button>
+                  </a>
+                )}
+              </div>
+
+              <div className="flex gap-2 pt-1">
                 {selectedUser.status === 'suspended' ? (
                   <Button
                     variant="outline"
@@ -1470,6 +2077,371 @@ export function UserManagement({
                 Close Logs
               </Button>
            </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Bulk Approval Modal (Pending Review Users) ── */}
+      <Dialog open={showBulkApprovalDialog} onOpenChange={setShowBulkApprovalDialog}>
+        <DialogContent className="w-[95vw] sm:max-w-4xl p-0 border-0 rounded-[2rem] shadow-2xl bg-white overflow-hidden flex flex-col max-h-[90vh]">
+          {/* Header */}
+          <div className=" from-slate-900 via-slate-800 to-slate-900 px-6 py-5 text-white shrink-0">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="h-11 w-11 rounded-2xl bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400 shrink-0">
+                  <ShieldCheck className="h-6 w-6" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-white leading-tight flex items-center gap-2">
+                    Pending Review Users — Bulk Approval
+                  </h2>
+                  <p className="text-[11px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">
+                    Select users, edit profile details, and approve access in one click
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 self-start sm:self-center">
+                <Badge className="bg-orange text-black border-amber-500/30 text-md font-black px-3 py-1 rounded-xl">
+                  {pendingUsers.length} Pending
+                </Badge>
+                <Badge className="text-blue-300 border-blue-500/30 text-md font-black px-3 py-1 rounded-xl">
+                  {selectedPendingUserIds.size} Selected
+                </Badge>
+              </div>
+            </div>
+          </div>
+
+          {/* Controls Bar: Search + Select All + College Filter + Target Role & Course Type */}
+          <div className="p-4 border-b border-slate-100 bg-slate-50/70 space-y-3 shrink-0">
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+              {/* Search Box */}
+              <div className="relative flex-1">
+                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                <Input
+                  placeholder="Search pending by name, email, college, or phone..."
+                  value={bulkSearchQuery}
+                  onChange={(e) => setBulkSearchQuery(e.target.value)}
+                  className="pl-9 h-10 rounded-xl bg-white border-slate-200 text-xs font-semibold"
+                />
+              </div>
+
+              {/* College Filter */}
+              <div className="sm:w-52">
+                <Select value={bulkCollegeFilter} onValueChange={setBulkCollegeFilter}>
+                  <SelectTrigger className="h-10 rounded-xl bg-white border-slate-200 text-xs font-bold">
+                    <SelectValue placeholder="All Colleges" />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-xl border-slate-200 max-h-56">
+                    <SelectItem value="all" className="text-xs font-bold py-1.5">All Colleges ({pendingUsers.length})</SelectItem>
+                    {pendingColleges.map((col) => (
+                      <SelectItem key={col} value={col} className="text-xs py-1.5 truncate">
+                        {col}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Select All / Deselect Toggle */}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={toggleSelectAllFiltered}
+                className="h-10 px-4 rounded-xl border-slate-200 bg-white hover:bg-slate-100 font-bold text-xs shrink-0 flex items-center gap-2"
+              >
+                <Checkbox
+                  checked={isAllFilteredSelected}
+                  onCheckedChange={toggleSelectAllFiltered}
+                  className="pointer-events-none"
+                />
+                <span>{isAllFilteredSelected ? "Deselect All" : `Select All (${filteredPendingUsers.length})`}</span>
+              </Button>
+            </div>
+
+            {/* Display Count Banner */}
+            <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-indigo-50/70 border border-indigo-100/80 text-[11px] font-bold text-indigo-900">
+              <span className="flex items-center gap-1.5">
+                <Users className="h-3.5 w-3.5 text-indigo-600" />
+                Showing <strong>{filteredPendingUsers.length}</strong> of <strong>{pendingUsers.length}</strong> Pending Users
+              </span>
+              <span className="bg-indigo-600 text-white px-2.5 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider">
+                {selectedPendingUserIds.size} Selected
+              </span>
+            </div>
+
+            {/* Bulk Update Options (Course Type, Role, College, Course Programme, Batch overrides) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 pt-2 border-t border-slate-200/60 text-xs">
+              {/* Target Course Type */}
+              <div className="flex flex-col gap-1">
+                <span className="text-slate-500 font-bold uppercase text-[10px] tracking-wider">Course Type:</span>
+                <Select value={bulkTargetCourseType} onValueChange={handleBulkCourseTypeChange}>
+                  <SelectTrigger className="h-9 w-full rounded-xl bg-white border-slate-200 text-xs font-bold">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-xl">
+                    <SelectItem value="keep" className="text-xs font-bold py-1.5">Keep Registered</SelectItem>
+                    <SelectItem value="full_time" className="text-xs font-bold py-1.5 text-blue-600">Full Time Student</SelectItem>
+                    <SelectItem value="internship" className="text-xs font-bold py-1.5 text-amber-600">Internship Student</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Target Role */}
+              <div className="flex flex-col gap-1">
+                <span className="text-slate-500 font-bold uppercase text-[10px] tracking-wider">Assign Role:</span>
+                <Select value={bulkTargetRole} onValueChange={setBulkTargetRole}>
+                  <SelectTrigger className="h-9 w-full rounded-xl bg-white border-slate-200 text-xs font-bold">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-xl">
+                    <SelectItem value="keep" className="text-xs font-bold py-1.5">Keep Registered</SelectItem>
+                    <SelectItem value="student" className="text-xs font-bold py-1.5 text-blue-600">Student</SelectItem>
+                    <SelectItem value="intern" className="text-xs font-bold py-1.5 text-amber-600">Intern</SelectItem>
+                    <SelectItem value="instructor" className="text-xs font-bold py-1.5 text-emerald-600">Instructor</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Target Course Programme */}
+              <div className="flex flex-col gap-1">
+                <span className="text-slate-500 font-bold uppercase text-[10px] tracking-wider">Course Programme:</span>
+                <Select value={bulkTargetCourseProgramme} onValueChange={handleBulkCourseProgrammeChange}>
+                  <SelectTrigger className="h-9 w-full rounded-xl bg-white border-slate-200 text-xs font-bold">
+                    <SelectValue placeholder="Keep Registered" />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-xl max-h-52">
+                    <SelectItem value="keep" className="text-xs font-bold py-1.5">Keep Registered</SelectItem>
+                    {availableCourses.map((c) => (
+                      <SelectItem key={c.id} value={c.title} className="text-xs py-1.5 font-semibold">
+                        {c.title}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Target Batch */}
+              <div className="flex flex-col gap-1">
+                <span className="text-slate-500 font-bold uppercase text-[10px] tracking-wider">Batch:</span>
+                <Select value={bulkTargetBatch} onValueChange={setBulkTargetBatch}>
+                  <SelectTrigger className="h-9 w-full rounded-xl bg-white border-slate-200 text-xs font-bold">
+                    <SelectValue placeholder="Keep Registered" />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-xl max-h-52">
+                    {availableBatches.map((b) => (
+                      <SelectItem key={b} value={b} className="text-xs py-1.5 font-semibold">
+                        {b === "keep" ? "Keep Registered" : b}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Target College Name */}
+              <div className="flex flex-col gap-1">
+                <span className="text-slate-500 font-bold uppercase text-[10px] tracking-wider">College Name:</span>
+                <Select value={bulkTargetCollege} onValueChange={setBulkTargetCollege}>
+                  <SelectTrigger className="h-9 w-full rounded-xl bg-white border-slate-200 text-xs font-bold">
+                    <SelectValue placeholder="Keep Registered" />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-xl max-h-52">
+                    <SelectItem value="keep" className="text-xs font-bold py-1.5">Keep Registered</SelectItem>
+                    {COLLEGES.map((col) => (
+                      <SelectItem key={col} value={col} className="text-xs py-1.5 truncate font-semibold">
+                        {col}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+
+          {/* User List Content */}
+          <div className="flex-1 overflow-y-auto p-4 space-y-2.5 custom-scrollbar min-h-[300px]">
+            {filteredPendingUsers.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-20 text-center">
+                <div className="h-16 w-16 rounded-3xl bg-slate-100 flex items-center justify-center mb-3 text-slate-400">
+                  <CheckCircle2 className="h-8 w-8 text-emerald-500" />
+                </div>
+                <p className="text-base font-black text-slate-800">No Pending Review Users</p>
+                <p className="text-xs text-slate-500 max-w-sm mt-1">
+                  {bulkSearchQuery || bulkCollegeFilter !== 'all'
+                    ? "No pending users matched your current search or filter."
+                    : "All registered users have already been reviewed and approved!"}
+                </p>
+              </div>
+            ) : (
+              filteredPendingUsers.map((user) => {
+                const isSelected = selectedPendingUserIds.has(user.id);
+                return (
+                  <div
+                    key={user.id}
+                    className={`flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 rounded-2xl border transition-all ${
+                      isSelected
+                        ? "bg-amber-50/50 border-amber-300 shadow-sm"
+                        : "bg-white border-slate-200 hover:border-slate-300"
+                    }`}
+                  >
+                    {/* Left: Checkbox + Avatar + Info */}
+                    <div className="flex items-start sm:items-center gap-3 min-w-0 flex-1">
+                      <Checkbox
+                        checked={isSelected}
+                        onCheckedChange={() => toggleSelectUser(user.id)}
+                        className="mt-1 sm:mt-0"
+                      />
+
+                      <Avatar className="h-11 w-11 rounded-xl shrink-0 border border-slate-200">
+                        <AvatarImage src={user.avatar_url} />
+                        <AvatarFallback className="bg-slate-900 text-white font-black text-sm">
+                          {(user.full_name || user.email || "U").charAt(0).toUpperCase()}
+                        </AvatarFallback>
+                      </Avatar>
+
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-extrabold text-sm text-slate-900 truncate">
+                            {user.full_name || "Platform User"}
+                          </span>
+                          <Badge variant="outline" className="text-[10px] font-black uppercase px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border-amber-200">
+                            Pending Review
+                          </Badge>
+                          {user.course_type && (
+                            <Badge variant="outline" className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border-blue-200">
+                              {user.course_type}
+                            </Badge>
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 font-semibold">
+                          <span className="flex items-center gap-1.5 truncate">
+                            <Mail className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                            {user.email}
+                          </span>
+                          {(user.mobile_number || (user as any).phone) && (
+                            <span className="flex items-center gap-1.5">
+                              <Phone className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                              {user.mobile_number || (user as any).phone}
+                            </span>
+                          )}
+                          {user.college_name && (
+                            <span className="flex items-center gap-1.5 text-indigo-600 font-bold truncate max-w-[280px]">
+                              <GraduationCap className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
+                              {user.college_name}
+                            </span>
+                          )}
+                          {(user.registration_date || user.created_at) && (
+                            <span className="flex items-center gap-1 text-[11px] text-slate-400 font-normal">
+                              <Clock className="h-3 w-3" />
+                              {user.registration_date || new Date(user.created_at || '').toLocaleDateString('en-IN')}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Right: Individual Action Buttons (Edit Profile + Single Approve) */}
+                    <div className="flex items-center gap-2 shrink-0 self-end sm:self-center pl-7 sm:pl-0">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => openEditProfileForUser(user)}
+                        className="h-8 px-3 rounded-lg border-slate-200 hover:border-indigo-300 hover:text-indigo-600 font-bold text-xs flex items-center gap-1.5 bg-white shadow-xs"
+                        title="Edit profile & college details before approval"
+                      >
+                        <Edit className="h-3.5 w-3.5 text-indigo-500" />
+                        <span>Edit Profile</span>
+                      </Button>
+
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={async () => {
+                          const success = await onUpdateStatus(user.id, "approved");
+                          if (success) {
+                            setSelectedPendingUserIds(prev => {
+                              const next = new Set(prev);
+                              next.delete(user.id);
+                              return next;
+                            });
+                            if (onSync) onSync();
+                          }
+                        }}
+                        className="h-8 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm"
+                        title="Approve this single user"
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                        <span>Approve</span>
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* Footer Bar: Sticky High-Contrast Actions Bar */}
+          <div className="p-4 border-t-2 border-emerald-500/30 bg-slate-900 text-white flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 shrink-0 shadow-2xl z-30">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 bg-slate-800/90 border border-slate-700/80 px-3.5 py-1.5 rounded-xl">
+                <Users className="h-4 w-4 text-emerald-400" />
+                <span className="text-xs font-bold text-slate-300">
+                  Selected: <strong className="text-white text-sm font-black">{selectedPendingUserIds.size}</strong> of {filteredPendingUsers.length}
+                </span>
+              </div>
+
+              {(bulkTargetRole !== "keep" || bulkTargetCourseType !== "keep" || bulkTargetCollege !== "keep" || bulkTargetCourseProgramme !== "keep" || bulkTargetBatch !== "keep") && (
+                <div className="hidden md:flex items-center gap-1.5 text-[10px] text-amber-300 font-semibold bg-amber-500/10 border border-amber-500/20 px-2.5 py-1 rounded-lg">
+                  <span>⚡ Applying:</span>
+                  {bulkTargetCourseType !== "keep" && <Badge variant="outline" className="text-[9px] border-amber-400/40 text-amber-300 px-1 py-0">{bulkTargetCourseType}</Badge>}
+                  {bulkTargetRole !== "keep" && <Badge variant="outline" className="text-[9px] border-blue-400/40 text-blue-300 px-1 py-0">{bulkTargetRole}</Badge>}
+                  {bulkTargetCourseProgramme !== "keep" && <Badge variant="outline" className="text-[9px] border-emerald-400/40 text-emerald-300 px-1 py-0 truncate max-w-[100px]">{bulkTargetCourseProgramme}</Badge>}
+                  {bulkTargetBatch !== "keep" && <Badge variant="outline" className="text-[9px] border-purple-400/40 text-purple-300 px-1 py-0 truncate max-w-[90px]">{bulkTargetBatch}</Badge>}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setShowBulkApprovalDialog(false)}
+                className="h-11 px-5 rounded-xl font-bold text-xs text-slate-400 hover:text-white hover:bg-slate-800"
+              >
+                Close
+              </Button>
+
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isBulkProcessing || selectedPendingUserIds.size === 0}
+                onClick={() => handleBulkApprove("rejected")}
+                className="h-11 px-4 rounded-xl border-rose-500/40 bg-rose-950/40 text-rose-300 hover:bg-rose-900/60 font-bold text-xs disabled:opacity-40"
+              >
+                Reject Selected
+              </Button>
+
+              <Button
+                type="button"
+                disabled={isBulkProcessing || selectedPendingUserIds.size === 0}
+                onClick={() => handleBulkApprove("approved")}
+                className="h-11 px-7 rounded-xl bg-gradient-to-r from-emerald-500 via-teal-500 to-emerald-600 hover:from-emerald-600 hover:to-teal-600 text-slate-950 font-black text-xs uppercase tracking-wider shadow-lg shadow-emerald-500/30 ring-2 ring-emerald-400/50 flex items-center gap-2.5 active:scale-95 transition-all disabled:opacity-40 disabled:pointer-events-none"
+              >
+                {isBulkProcessing ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin text-slate-950" />
+                    <span>Processing...</span>
+                  </>
+                ) : (
+                  <>
+                    <ShieldCheck className="h-5 w-5 text-slate-950" />
+                    <span>Approve Selected ({selectedPendingUserIds.size})</span>
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
     </div>
