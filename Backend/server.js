@@ -18,7 +18,6 @@ const os = require('os');
 const { execFile } = require('child_process');
 const pdfParse = require('pdf-parse');
 const FormData = require('form-data');
-const { sendEmail } = require('./utils/email');
 
 // Cloudinary Config
 cloudinary.config({
