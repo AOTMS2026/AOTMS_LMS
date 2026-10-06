@@ -86,3 +86,11 @@ export const fetchWithAuth = async <T = unknown>(
 
   return res.json();
 };
+
+export const parseJsonResponse = async <T = any>(res: Response): Promise<T> => {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    return {} as T;
+  }
+};
