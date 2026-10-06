@@ -89,3 +89,11 @@ export const fetchWithAuth = async <T = unknown>(
 
   return res.json();
 };
+
+export const parseJsonResponse = async (res: Response) => {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+};
