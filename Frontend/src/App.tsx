@@ -18,7 +18,6 @@ const Home = lazy(() => import("./pages/Home"));
 const Auth = lazy(() => import("./pages/Auth"));
 const InstructorRegister = lazy(() => import("./pages/InstructorRegister"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
-const InternDashboard = lazy(() => import("./pages/Interndashboard"));
 const InstructorDashboard = lazy(() => import("./pages/InstructorDashboard"));
 const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
 const ManagerDashboard = lazy(() => import("./pages/ManagerDashboard"));
@@ -240,26 +239,6 @@ const App = () => (
                     allowedRoles={["student", "instructor", "admin"]}
                   >
                     <Dashboard />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/intern-dashboard"
-                element={
-                  <ProtectedRoute
-                    allowedRoles={["intern", "admin"]}
-                  >
-                    <InternDashboard />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/intern-dashboard/*"
-                element={
-                  <ProtectedRoute
-                    allowedRoles={["intern", "admin"]}
-                  >
-                    <InternDashboard />
                   </ProtectedRoute>
                 }
               />
