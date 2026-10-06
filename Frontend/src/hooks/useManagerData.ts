@@ -197,8 +197,6 @@ export function useExams() {
   return useQuery<Exam[]>({
     queryKey: ['exams'],
     queryFn: () => fetchWithAuth('/data/exams?sort=scheduled_date&order=asc&select=title,status,approval_status,scheduled_date,assigned_image,duration_minutes,total_marks,exam_type,created_by,created_at'),
-    staleTime: 60000,
-    refetchInterval: 60000,
   });
 }
 
@@ -286,8 +284,6 @@ export function useQuestions() {
   return useQuery<Question[]>({
     queryKey: ['questions'],
     queryFn: () => fetchWithAuth('/data/question_bank?sort=created_at&order=desc'),
-    staleTime: 60000,
-    refetchInterval: 60000,
   });
 }
 
@@ -364,8 +360,6 @@ export const useLeaderboard = () => {
   return useQuery<LeaderboardEntry[]>({
     queryKey: ['leaderboard'],
     queryFn: () => fetchWithAuth<LeaderboardEntry[]>('/data/leaderboard?sort=total_score&order=desc'),
-    staleTime: 60000,
-    refetchInterval: 60000,
   });
 };
 
@@ -591,3 +585,4 @@ export function useStudentBatches() {
     queryFn: () => fetchWithAuth('/data/student_batches'),
   });
 }
+

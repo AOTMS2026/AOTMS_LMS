@@ -1,3 +1,4 @@
+
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { Button } from '@/components/ui/button';
@@ -10,7 +11,6 @@ import { useToast } from '@/hooks/use-toast';
 import { Loader2, Save, Upload, Github, Briefcase, Copy, CheckCircle, ExternalLink, Linkedin } from 'lucide-react';
 import { Textarea } from '@/components/ui/textarea';
 import { useRef } from 'react';
-import { API_URL } from '@/lib/api';
 
 interface ProfileData {
     id: string;
@@ -41,6 +41,7 @@ interface ProfileData {
     longitude?: number | null;
 }
 
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
 
 export function UserProfile() {
     const { user, userRole, checkSession } = useAuth();

@@ -24,7 +24,6 @@ export interface Profile {
   longitude?: number | null;
   college_name?: string | null;
   institute_name?: string | null;
-  course_type?: 'full_time' | 'internship' | 'bridge' | string | null;
 }
 
 export interface UserRole {
