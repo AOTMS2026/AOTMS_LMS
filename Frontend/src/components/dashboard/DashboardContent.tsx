@@ -72,8 +72,6 @@ import { Notifications } from "./Notifications";
 import { StudentSettings } from "./StudentSettings";
 import { StudentResumeScan } from "./StudentResumeScan";
 import { StudentBatchSelector } from "./StudentBatchSelector";
-import { ChatInterface } from "../chat/ChatInterface";
-import CertificationPage from "./CertificationPage";
 import { StudentAttendance } from "./StudentAttendance";
 import {
   StudentCourse,
@@ -1227,12 +1225,6 @@ const routeConfig: Record<string, { title: string; description: string; icon: Re
     description: "Configure your digital learning environment",
     icon: Settings,
     component: <StudentSettings />,
-  },
-  "/student-dashboard/certification": {
-    title: "Certification",
-    description: "Download your official course completion certificates",
-    icon: Award,
-    component: <CertificationPage />,
   },
 };
 
