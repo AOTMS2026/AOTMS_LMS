@@ -94,3 +94,28 @@ export const parseJsonResponse = async <T = any>(res: Response): Promise<T> => {
     return {} as T;
   }
 };
+
+export const refreshAccessToken = async (): Promise<string | null> => {
+  const refreshToken = localStorage.getItem("refresh_token");
+  if (!refreshToken) return null;
+  try {
+    const res = await fetch(`${API_URL}/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.session?.access_token) {
+        localStorage.setItem("access_token", data.session.access_token);
+        if (data.session.refresh_token) {
+          localStorage.setItem("refresh_token", data.session.refresh_token);
+        }
+        return data.session.access_token;
+      }
+    }
+  } catch (err) {
+    console.warn("refreshAccessToken failed", err);
+  }
+  return null;
+};
