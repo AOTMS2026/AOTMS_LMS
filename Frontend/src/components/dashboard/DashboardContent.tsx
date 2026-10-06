@@ -72,6 +72,7 @@ import { Notifications } from "./Notifications";
 import { StudentSettings } from "./StudentSettings";
 import { StudentResumeScan } from "./StudentResumeScan";
 import { StudentBatchSelector } from "./StudentBatchSelector";
+import { ChatInterface } from "../chat/ChatInterface";
 import { StudentAttendance } from "./StudentAttendance";
 import {
   StudentCourse,
