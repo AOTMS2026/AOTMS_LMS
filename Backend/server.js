@@ -1005,17 +1005,25 @@ app.post('/api/run-code', authenticateToken, async (req, res) => {
 // --- Auth Routes ---
 
 // Helper to trigger n8n OTP Webhook with automatic Test/Prod URL fallback
-const triggerOtpWebhook = async ({ email, full_name, otp }) => {
+const triggerOtpWebhook = async ({ email, full_name, otp, phone, type }) => {
     let n8nUrl = (process.env.OTP_N8N_URL || process.env.OTP_N8n || process.env.OTP_N8N || 'https://aotms.app.n8n.cloud/webhook/Email').trim();
-    console.log(`[AUTH-OTP Webhook] Triggering n8n at ${n8nUrl} for ${email}...`);
+    console.log(`[AUTH-OTP Webhook] Triggering n8n at ${n8nUrl} for ${email} (Phone: ${phone || 'N/A'}, Type: ${type || 'auth_otp'})...`);
+
+    const payload = {
+        email,
+        full_name: full_name || 'Student',
+        name: full_name || 'Student',
+        otp: otp || '',
+        phone: phone || '',
+        mobile_number: phone || '',
+        mobile: phone || '',
+        type: type || 'auth_otp',
+        timestamp: new Date().toISOString()
+    };
 
     try {
-        const response = await axios.post(n8nUrl, {
-            email,
-            full_name: full_name || 'Student',
-            otp
-        }, { timeout: 8000 });
-        console.log(`[AUTH-OTP Webhook] Successfully delivered OTP via n8n for ${email}:`, response.data);
+        const response = await axios.post(n8nUrl, payload, { timeout: 8000 });
+        console.log(`[AUTH-OTP Webhook] Successfully delivered to n8n for ${email}:`, response.data);
         return true;
     } catch (err) {
         // Automatically try swapping between test URL (/webhook-test/) and prod URL (/webhook/)
@@ -1025,12 +1033,8 @@ const triggerOtpWebhook = async ({ email, full_name, otp }) => {
 
         console.warn(`[AUTH-OTP Webhook Primary Failed: ${err.message}]. Retrying with fallback URL: ${altUrl}...`);
         try {
-            const altResponse = await axios.post(altUrl, {
-                email,
-                full_name: full_name || 'Student',
-                otp
-            }, { timeout: 8000 });
-            console.log(`[AUTH-OTP Webhook Fallback] Successfully delivered OTP via n8n (${altUrl}) for ${email}:`, altResponse.data);
+            const altResponse = await axios.post(altUrl, payload, { timeout: 8000 });
+            console.log(`[AUTH-OTP Webhook Fallback] Successfully delivered to n8n (${altUrl}) for ${email}:`, altResponse.data);
             return true;
         } catch (fallbackErr) {
             console.error(`[AUTH-OTP Webhook Error]: n8n Webhook failed (${err.message} / ${fallbackErr.message}).`);
@@ -1040,7 +1044,7 @@ const triggerOtpWebhook = async ({ email, full_name, otp }) => {
 };
 
 app.post('/api/auth/send-otp', async (req, res) => {
-    const { email, full_name } = req.body;
+    const { email, full_name, phone } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     try {
@@ -1064,8 +1068,14 @@ app.post('/api/auth/send-otp', async (req, res) => {
 
         console.log(`[AUTH-OTP] Generated OTP for ${email}: ${otp}`);
 
-        // Trigger n8n Webhook for OTP Email
-        await triggerOtpWebhook({ email, full_name, otp });
+        let targetPhone = phone || '';
+        if (!targetPhone) {
+            const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
+            targetPhone = existingUser?.phone || '';
+        }
+
+        // Trigger n8n Webhook for OTP Email & Calling
+        await triggerOtpWebhook({ email, full_name, otp, phone: targetPhone, type: 'auth_otp' });
 
         res.json({ message: 'OTP sent successfully' });
     } catch (err) {
@@ -1074,7 +1084,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
 });
 
 app.post('/api/auth/resend-otp', async (req, res) => {
-    const { email, full_name } = req.body;
+    const { email, full_name, phone } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     try {
@@ -1097,8 +1107,14 @@ app.post('/api/auth/resend-otp', async (req, res) => {
         );
         console.log(`[AUTH-OTP] Resent OTP for ${email}: ${otp}`);
 
-        // Trigger n8n Webhook for OTP Email
-        await triggerOtpWebhook({ email, full_name, otp });
+        let targetPhone = phone || '';
+        if (!targetPhone) {
+            const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
+            targetPhone = existingUser?.phone || '';
+        }
+
+        // Trigger n8n Webhook for OTP Email & Calling
+        await triggerOtpWebhook({ email, full_name, otp, phone: targetPhone, type: 'resend_otp' });
 
         res.json({ message: 'OTP resent successfully' });
     } catch (err) {
@@ -1189,22 +1205,14 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         resetOtpStore.set(email.toLowerCase().trim(), { otp, expiresAt, failedAttempts: 0, createdAt: Date.now() });
         setTimeout(() => resetOtpStore.delete(email.toLowerCase().trim()), 5 * 60 * 1000);
 
-        // Call n8n webhook — it emails the OTP to the user
-        try {
-            await fetch('https://aotms.app.n8n.cloud/webhook/Email', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    email: email.toLowerCase().trim(),
-                    otp,
-                    name: user.full_name || 'User',
-                    type: 'forgot_password'
-                })
-            });
-        } catch (n8nErr) {
-            console.error('[ForgotPassword] n8n webhook failed:', n8nErr.message);
-            // Don't fail — OTP is stored, but email may not be sent
-        }
+        // Call n8n webhook — it emails/calls the OTP to the user
+        await triggerOtpWebhook({
+            email: email.toLowerCase().trim(),
+            full_name: user.full_name || 'User',
+            otp,
+            phone: user.phone || '',
+            type: 'forgot_password'
+        });
 
         console.log(`[ForgotPassword] OTP ${otp} generated for ${email}`);
         res.json({ success: true, message: 'OTP sent to your email.' });
@@ -1406,6 +1414,15 @@ app.post('/api/auth/signup', async (req, res) => {
             maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
         });
 
+        // Trigger n8n Webhook for Registration confirmation & calling
+        triggerOtpWebhook({
+            email,
+            full_name: fullName,
+            otp: '',
+            phone: phone || '',
+            type: 'signup_welcome'
+        }).catch(e => console.error('[Signup n8n webhook error]:', e.message));
+
         res.json({
             user: { id: user._id, email, full_name: fullName, avatar_url: avatarUrl, role: assignedRole },
             session: { access_token: token, expires_in: 1800 }
@@ -1547,6 +1564,15 @@ app.post('/api/auth/login', async (req, res) => {
                 user_id: user._id,
                 ip_address: loginIp,
                 details: { email, timestamp: loginTime }
+            });
+
+            // Trigger n8n Webhook for Admin OTP & Calling
+            await triggerOtpWebhook({
+                email,
+                full_name: user.full_name,
+                otp,
+                phone: user.phone || profile?.mobile_number || '',
+                type: 'admin_login_otp'
             });
 
             // Send Admin Login OTP directly via Resend email helper
@@ -1736,6 +1762,15 @@ app.post('/api/auth/admin-resend-otp', async (req, res) => {
             { otp, full_name: user.full_name, expires_at: expiresAt, created_at: new Date() },
             { upsert: true, returnDocument: 'after' }
         );
+
+        // Trigger n8n Webhook for Admin Resend OTP & Calling
+        await triggerOtpWebhook({
+            email,
+            full_name: user.full_name,
+            otp,
+            phone: user.phone || '',
+            type: 'admin_resend_otp'
+        });
 
         // Send Admin Login OTP directly via Resend email helper
         const otpHtml = `
