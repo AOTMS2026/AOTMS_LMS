@@ -15,8 +15,8 @@ const sendEmail = async ({ to, subject, html, text }) => {
     const apiKey = process.env.BREVO_SMTP_PASS;
 
     if (!apiKey) {
-        console.error('[Brevo Error] BREVO_SMTP_PASS key is not configured.');
-        throw new Error('Email credentials are not configured.');
+        console.warn(`[Email Warning] BREVO_SMTP_PASS key is not configured in .env. Bypassing email send to ${to}. Check terminal console for OTP.`);
+        return { messageId: 'mock_no_smtp' };
     }
 
     // Try port 2525 first (Render typically allows outbound on 2525 while blocking 587/465)
