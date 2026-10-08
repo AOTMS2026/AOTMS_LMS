@@ -8,6 +8,11 @@ services:
       - "5000"
     deploy:
       replicas: 4
+      resources:
+        limits:
+          memory: 1024M
+        reservations:
+          memory: 128M
     env_file:
       - ./Backend/.env
     restart: always
