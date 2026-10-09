@@ -1,5 +1,16 @@
-export const API_URL =
-  import.meta.env.VITE_API_URL || "https://aotms-lms-dm0s.onrender.com/api";
+const getBaseApiUrl = (): string => {
+  let envUrl = import.meta.env.VITE_API_URL;
+  if (!envUrl || envUrl.includes("onrender.com")) {
+    return "/api";
+  }
+  let trimmed = envUrl.trim().replace(/\/+$/, "");
+  if (trimmed.includes("187.53.134.243") || !trimmed.startsWith("http")) {
+    return "/api";
+  }
+  return trimmed.endsWith("/api") ? trimmed : `${trimmed}/api`;
+};
+
+export const API_URL = getBaseApiUrl();
 
 export const fetchWithAuth = async <T = unknown>(
   url: string,

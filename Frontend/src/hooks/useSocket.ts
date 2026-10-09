@@ -4,7 +4,10 @@ import { useAuth } from './useAuth';
 
 // Determine the base URL for the socket connection
 const getSocketUrl = () => {
-  const apiUrl = (import.meta.env.VITE_API_URL || import.meta.env.VITE_RENDER_URL || 'http://localhost:5000').trim();
+  const apiUrl = (import.meta.env.VITE_API_URL || '').trim();
+  if (!apiUrl || apiUrl.includes("onrender.com") || apiUrl.startsWith('/') || apiUrl.includes("187.53.134.243")) {
+    return typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5000';
+  }
   return apiUrl.replace(/\/api\/?$/, '').replace(/\/+$/, '');
 };
 
