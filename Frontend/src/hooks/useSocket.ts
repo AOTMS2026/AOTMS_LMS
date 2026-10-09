@@ -69,13 +69,17 @@ export const SocketProvider = ({ children }: { children: React.ReactNode }) => {
 
     console.log(`[Socket] Connecting to ${socketUrl}...`);
 
+    const isLocal = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
     try {
       const newSocket = io(socketUrl, {
+        path: '/socket.io/',
         auth: { token },
-        transports: ['websocket'],
+        transports: isLocal ? ['websocket', 'polling'] : ['polling'],
         reconnection: true,
         reconnectionAttempts: 5,
-        reconnectionDelay: 1000,
+        reconnectionDelay: 2000,
+        timeout: 10000,
       });
 
       // 4. Event Listeners
@@ -95,9 +99,9 @@ export const SocketProvider = ({ children }: { children: React.ReactNode }) => {
       });
 
       newSocket.on('connect_error', (err) => {
-        // Suppress benign connection errors in development if backend is restarting
-        if (err.message === 'xhr poll error') return; 
-        console.warn('[Socket] Connection Error:', err.message);
+        // Suppress expected polling/reconnection errors during network hiccups
+        if (err.message === 'xhr poll error' || err.message === 'websocket error') return; 
+        console.warn('[Socket] Connection status:', err.message);
         setIsConnected(false);
       });
 
