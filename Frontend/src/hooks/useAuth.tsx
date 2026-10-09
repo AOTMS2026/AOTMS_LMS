@@ -176,7 +176,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           });
         } catch (refreshErr) {
           console.warn('Refresh failed during checkSession:', refreshErr);
-          await signOut();
+          // Never force auto-logout: maintain active user session until explicit user logout
+          setLoading(false);
           return;
         }
       }

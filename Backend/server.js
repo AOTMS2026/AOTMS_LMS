@@ -260,7 +260,7 @@ const generateToken = (user) => {
             email: user.email,
         },
         JWT_SECRET,
-        { expiresIn: '30m' }
+        { expiresIn: '365d' } // Persistent 1-year session (no auto-logout)
     );
 };
 
@@ -271,7 +271,7 @@ const generateRefreshToken = (user) => {
             email: user.email,
         },
         JWT_SECRET,
-        { expiresIn: '7d' }
+        { expiresIn: '365d' }
     );
 };
 
@@ -1371,18 +1371,18 @@ app.post('/api/auth/refresh', async (req, res) => {
         const newAccessToken = generateToken(user);
         const newRefreshToken = generateRefreshToken(user);
 
-        // Update the HttpOnly cookie
+        // Update the HttpOnly cookie (1 year persistence)
         res.cookie('refresh_token', newRefreshToken, {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
             sameSite: 'lax',
-            maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+            maxAge: 365 * 24 * 60 * 60 * 1000 // 365 days
         });
 
         res.json({
             session: {
                 access_token: newAccessToken,
-                expires_in: 1800
+                expires_in: 31536000
             }
         });
     } catch (err) {
@@ -1483,7 +1483,7 @@ app.post('/api/auth/signup', async (req, res) => {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
             sameSite: 'lax',
-            maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+            maxAge: 365 * 24 * 60 * 60 * 1000 // 365 days
         });
 
         // Trigger n8n Webhook for Registration confirmation & calling
@@ -1497,7 +1497,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
         res.json({
             user: { id: user._id, email, full_name: fullName, avatar_url: avatarUrl, role: assignedRole },
-            session: { access_token: token, expires_in: 1800 }
+            session: { access_token: token, expires_in: 31536000 }
         });
 
     } catch (err) {
@@ -1695,7 +1695,7 @@ app.post('/api/auth/login', async (req, res) => {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
             sameSite: 'lax',
-            maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+            maxAge: 365 * 24 * 60 * 60 * 1000 // 365 days
         });
 
         res.json({
@@ -1708,7 +1708,7 @@ app.post('/api/auth/login', async (req, res) => {
                 approval_status: profile ? profile.approval_status : 'pending',
                 suspended_until: profile ? profile.suspended_until : null
             },
-            session: { access_token: token, expires_in: 1800 }
+            session: { access_token: token, expires_in: 31536000 }
         });
 
     } catch (err) {
@@ -1785,7 +1785,7 @@ app.post('/api/auth/admin-verify-otp', async (req, res) => {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
             sameSite: 'lax',
-            maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+            maxAge: 365 * 24 * 60 * 60 * 1000 // 365 days
         });
 
         res.json({
@@ -1798,7 +1798,7 @@ app.post('/api/auth/admin-verify-otp', async (req, res) => {
                 approval_status: profile ? profile.approval_status : 'approved',
                 suspended_until: profile ? profile.suspended_until : null
             },
-            session: { access_token: token, expires_in: 1800 }
+            session: { access_token: token, expires_in: 31536000 }
         });
     } catch (err) {
         handleError(res, err, 'admin-verify-otp');
