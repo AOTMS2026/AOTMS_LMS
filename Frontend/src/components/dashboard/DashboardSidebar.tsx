@@ -30,6 +30,7 @@ import {
   MessageSquare,
   Folder,
   ClipboardList,
+  Award,
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
@@ -59,6 +60,7 @@ const navigationGroups = [
     items: [
       { title: "Resume ATS", url: "/student-dashboard/resume-ats", icon: Zap },
       { title: "Mock Papers", url: "/student-dashboard/mock-papers", icon: FileText },
+      { title: "Exam Results", url: "/student-dashboard/results", icon: Award },
     ],
   },
   {

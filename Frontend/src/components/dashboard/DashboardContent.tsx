@@ -1202,6 +1202,12 @@ const routeConfig: Record<string, { title: string; description: string; icon: Re
     icon: History,
     component: <StudentHistory />,
   },
+  "/student-dashboard/results": {
+    title: "Exam & Test Results",
+    description: "Review your past test scores, performance reports and answer reviews",
+    icon: Award,
+    component: <StudentHistory />,
+  },
   "/student-dashboard/attendance": {
     title: "My Attendance",
     description: "Track and review your daily attendance records",

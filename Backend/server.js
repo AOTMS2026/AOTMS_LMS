@@ -6217,6 +6217,164 @@ app.post('/api/instructor/grade-result/:resultId', authenticateToken, requireIns
     }
 });
 
+// 2.5 Get All Student Results for Instructors / Admins
+app.get('/api/instructor/student-results', authenticateToken, async (req, res) => {
+    try {
+        const userRole = await getUserRole(req.user.id);
+        if (!['admin', 'instructor', 'manager'].includes(userRole)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        const { course_id } = req.query;
+        let query = {};
+
+        // If specific course filter requested
+        if (course_id && course_id !== 'all') {
+            const courseObjId = (course_id.length === 24 && /^[0-9a-fA-F]{24}$/.test(course_id))
+                ? new mongoose.Types.ObjectId(course_id)
+                : course_id;
+            query['course_id'] = courseObjId;
+        } else if (userRole === 'instructor') {
+            // Instructor courses isolation
+            const instructorCourses = await Course.find({
+                $or: [{ instructor_id: req.user.id }, { instructor_ids: req.user.id }]
+            }).select('_id').lean();
+            const courseIds = instructorCourses.map(c => c._id);
+
+            const exams = await Exam.find({
+                $or: [
+                    { course_id: { $in: courseIds } },
+                    { created_by: req.user.id }
+                ]
+            }).select('_id').lean();
+            const examIds = exams.map(e => e._id);
+
+            // Also check batches assigned to instructor
+            const myBatches = await Batch.find({ instructor_id: req.user.id }).select('_id').lean();
+            const myBatchIds = myBatches.map(b => b._id);
+            const myStudents = await StudentBatch.find({ batch_id: { $in: myBatchIds } }).select('student_id').lean();
+            const myStudentIds = myStudents.map(s => s.student_id);
+
+            const conditions = [];
+            if (courseIds.length > 0) conditions.push({ course_id: { $in: courseIds } });
+            if (examIds.length > 0) {
+                conditions.push({ exam_id: { $in: examIds } });
+                conditions.push({ mock_paper_id: { $in: examIds } });
+            }
+            if (myStudentIds.length > 0) conditions.push({ student_id: { $in: myStudentIds } });
+
+            if (conditions.length > 0) {
+                query['$or'] = conditions;
+            }
+        }
+
+        const rawResults = await ExamResult.find(query)
+            .sort({ submitted_at: -1 })
+            .limit(500)
+            .populate('exam_id', 'title total_marks passing_marks exam_type')
+            .populate('course_id', 'title')
+            .lean();
+
+        // Collect student IDs to batch fetch Profiles and Users
+        const studentIds = [...new Set(rawResults.map(r => r.student_id ? r.student_id.toString() : null).filter(Boolean))];
+        const studentObjIds = studentIds.map(id => (id.length === 24 && /^[0-9a-fA-F]{24}$/.test(id)) ? new mongoose.Types.ObjectId(id) : id);
+
+        const [profiles, users, studentBatches] = await Promise.all([
+            Profile.find({ user_id: { $in: [...studentObjIds, ...studentIds] } }).lean(),
+            User.find({ _id: { $in: studentObjIds } }).select('full_name email avatar_url').lean(),
+            StudentBatch.find({ student_id: { $in: [...studentObjIds, ...studentIds] } }).populate('batch_id', 'batch_name batch_type').lean()
+        ]);
+
+        const profileMap = new Map();
+        profiles.forEach(p => {
+            if (p.user_id) profileMap.set(p.user_id.toString(), p);
+        });
+
+        const userMap = new Map();
+        users.forEach(u => {
+            if (u._id) userMap.set(u._id.toString(), u);
+        });
+
+        const batchMap = new Map();
+        studentBatches.forEach(sb => {
+            if (sb.student_id && sb.batch_id) {
+                batchMap.set(sb.student_id.toString(), sb.batch_id);
+            }
+        });
+
+        const results = rawResults.map(r => {
+            const sid = r.student_id ? r.student_id.toString() : '';
+            const profile = profileMap.get(sid);
+            const user = userMap.get(sid);
+            const batch = batchMap.get(sid);
+
+            const studentName = profile?.full_name || user?.full_name || 'Student';
+            const studentEmail = profile?.email || user?.email || '';
+            const studentAvatar = profile?.avatar_url || user?.avatar_url || '';
+            const studentCollege = profile?.college || profile?.college_name || '';
+            const batchName = batch?.batch_name || profile?.batch_name || profile?.batch || 'General Batch';
+            const batchType = batch?.batch_type || profile?.batch_type || 'regular';
+
+            const courseTitle = r.course_id?.title || (typeof r.course_id === 'string' ? r.course_id : '') || profile?.course_title || 'General Course';
+            const courseId = r.course_id?._id?.toString() || (typeof r.course_id === 'string' ? r.course_id : '') || '';
+
+            const examObj = r.exam_id;
+            const testTitle = r.test_title || examObj?.title || 'Assessment';
+            const totalMarks = examObj?.total_marks || r.total_questions || 100;
+            const passingMarks = examObj?.passing_marks || Math.round(totalMarks * 0.4);
+            const percentage = typeof r.percentage === 'number' ? Math.round(r.percentage * 10) / 10 : 0;
+            const passed = r.score >= passingMarks || percentage >= 40;
+
+            return {
+                id: r._id.toString(),
+                student_id: sid,
+                student_name: studentName,
+                student_email: studentEmail,
+                student_avatar: studentAvatar,
+                student_college: studentCollege,
+                batch_name: batchName,
+                batch_type: batchType,
+                course_id: courseId,
+                course_title: courseTitle,
+                test_title: testTitle,
+                exam_type: examObj?.exam_type || 'test',
+                score: r.score || 0,
+                total_questions: r.total_questions || 0,
+                total_marks: totalMarks,
+                passing_marks: passingMarks,
+                percentage,
+                passed,
+                grading_status: r.grading_status || 'graded',
+                time_spent: r.time_spent || 0,
+                submitted_at: r.submitted_at ? (r.submitted_at instanceof Date ? r.submitted_at.toISOString() : new Date(r.submitted_at).toISOString()) : new Date().toISOString(),
+                questions_count: r.questions_snapshot?.length || 0,
+                questions_snapshot: r.questions_snapshot || []
+            };
+        });
+
+        const totalSubmissions = results.length;
+        const uniqueStudents = new Set(results.map(r => r.student_id)).size;
+        const totalPct = results.reduce((acc, r) => acc + r.percentage, 0);
+        const avgPercentage = totalSubmissions > 0 ? Math.round((totalPct / totalSubmissions) * 10) / 10 : 0;
+        const passedCount = results.filter(r => r.passed).length;
+        const passRate = totalSubmissions > 0 ? Math.round((passedCount / totalSubmissions) * 100) : 0;
+        const topScore = results.length > 0 ? Math.max(...results.map(r => r.score)) : 0;
+
+        res.json({
+            summary: {
+                total_submissions: totalSubmissions,
+                unique_students: uniqueStudents,
+                avg_percentage: avgPercentage,
+                pass_rate: passRate,
+                top_score: topScore
+            },
+            results
+        });
+    } catch (err) {
+        handleError(res, err, 'instructor-student-results');
+    }
+});
+
 // 3. Request Re-evaluation (Student Only)
 app.post('/api/student/request-reevaluation/:resultId', authenticateToken, async (req, res) => {
     try {
@@ -6848,7 +7006,8 @@ app.get('/api/data/:table', authenticateToken, async (req, res) => {
             if (studentScopedTables[table]) {
                 const scopeField = studentScopedTables[table];
                 // Overwrite any attempted ID with the actual user ID to prevent unauthorized access
-                query[scopeField] = req.user.id;
+                const studentObjId = tryConvertId(req.user.id);
+                query[scopeField] = { $in: [studentObjId, req.user.id.toString()] };
                 console.log(`[ACL] Student scoping ${table} to ${scopeField}=${req.user.id}`);
             }
 
@@ -7124,8 +7283,9 @@ app.get('/api/data/:table', authenticateToken, async (req, res) => {
             data = await dataQuery.populate('user_id', 'full_name avatar_url email');
         } else if (table === 'exam_results') {
             data = await dataQuery
-                .populate('exam_id', 'title')
-                .populate('mock_paper_id', 'title');
+                .populate('exam_id', 'title total_marks passing_marks')
+                .populate('mock_paper_id', 'title')
+                .populate('course_id', 'title thumbnail_url category');
         } else if (table === 'courses') {
             data = await dataQuery
                 .populate('instructor_ids', 'full_name avatar_url');
