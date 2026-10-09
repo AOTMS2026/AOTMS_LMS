@@ -882,17 +882,51 @@ Do not include any Markdown wrapper like \`\`\`json or text explanation around t
     }
 });
 
-// --- Code Execution Helper ---
-// --- Code Execution Helper (Judge0 Integration) ---
+// --- Code Execution Helper (Native Execution + Judge0 Integration) ---
 const JUDGE0_API_KEY = process.env.JUDGE0_API_KEY;
 const JUDGE0_HOST = process.env.JUDGE0_HOST || 'judge0-extra-ce.p.rapidapi.com';
 
-const executeCode = async (language, sourceCode, stdin = '') => {
-    const lang = language?.toLowerCase();
+const executeNativePython = (sourceCode, stdin = '') => {
+    return new Promise((resolve) => {
+        const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+        const proc = require('child_process').spawn(pythonCmd, ['-c', sourceCode], {
+            timeout: 5000
+        });
 
-    // 1. Local JavaScript Execution (Fallback/Fast Path)
+        let stdout = '';
+        let stderr = '';
+
+        proc.stdout.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+        proc.on('error', () => {
+            resolve(null);
+        });
+
+        proc.on('close', (code) => {
+            resolve({
+                run: {
+                    stdout: stdout,
+                    stderr: stderr,
+                    code: code || 0,
+                    output: stdout || stderr
+                },
+                language: 'python'
+            });
+        });
+
+        if (stdin) {
+            proc.stdin.write(stdin);
+        }
+        proc.stdin.end();
+    });
+};
+
+const executeCode = async (language, sourceCode, stdin = '') => {
+    const lang = language?.toLowerCase()?.trim() || 'javascript';
+
+    // 1. Local JavaScript Execution (Safe Node.js VM Sandbox)
     if (lang === 'javascript' || lang === 'js' || lang === 'node') {
-        // ... (Keep existing local VM logic for JS as standard)
         return new Promise((resolve) => {
             const outputBuffer = [];
             const errorBuffer = [];
@@ -908,7 +942,7 @@ const executeCode = async (language, sourceCode, stdin = '') => {
             try {
                 const script = new vm.Script(sourceCode);
                 const context = vm.createContext(sandbox);
-                script.runInContext(context, { timeout: 2000 });
+                script.runInContext(context, { timeout: 3000 });
                 resolve({
                     run: {
                         stdout: outputBuffer.join('\n'),
@@ -927,58 +961,97 @@ const executeCode = async (language, sourceCode, stdin = '') => {
         });
     }
 
-    // 2. Judge0 Execution for Other Languages (Python, Java, etc.)
-    if (!JUDGE0_API_KEY) {
-        throw new Error('Judge0 API Key not configured for non-JS languages.');
+    // 2. Ultra-Fast Native Python Execution (Docker Container & Local)
+    if (lang === 'python' || lang === 'python3' || lang === 'py') {
+        try {
+            const nativeResult = await executeNativePython(sourceCode, stdin);
+            if (nativeResult) {
+                return nativeResult;
+            }
+        } catch (e) {
+            console.warn('[CodeExec] Native python failed, falling back to Judge0:', e.message);
+        }
     }
 
-    // Map common names to Judge0 Language IDs
+    // 3. Judge0 Execution (With RapidAPI Key OR Public Free Judge0 CE - Zero Key Required)
     const langMap = {
         'python': 71, // Python 3.8.1
         'python3': 71,
+        'py': 71,
         'java': 62,   // Java (OpenJDK 13.0.1)
         'cpp': 54,    // C++ (GCC 9.2.0)
         'c': 50,      // C (GCC 9.2.0)
+        'csharp': 51, // C# (Mono 6.6.0.161)
+        'cs': 51,
+        'go': 60,     // Go 1.13.5
+        'golang': 60,
+        'rust': 73,   // Rust 1.40.0
+        'ruby': 72,   // Ruby 2.7.0
+        'php': 68,    // PHP 7.4.1
     };
 
-    const languageId = langMap[language.toLowerCase()];
-    if (!languageId) throw new Error(`Language ${language} is not supported by backend compiler yet.`);
+    const languageId = langMap[lang] || 71;
 
     try {
-        console.log(`[Judge0] Submitting ${language} code...`);
-        // Step 1: Submit Code
-        const submitResponse = await axios.post(`https://${JUDGE0_HOST}/submissions`, {
-            source_code: Buffer.from(sourceCode).toString('base64'),
-            language_id: languageId,
-            stdin: Buffer.from(stdin).toString('base64'),
-        }, {
-            params: { wait: true, base64_encoded: true },
-            headers: {
-                'X-RapidAPI-Key': JUDGE0_API_KEY,
-                'X-RapidAPI-Host': JUDGE0_HOST,
-                'Content-Type': 'application/json'
-            }
-        });
+        console.log(`[CodeExec] Executing ${lang} via Judge0...`);
+        const b64Source = Buffer.from(sourceCode || '').toString('base64');
+        const b64Stdin = Buffer.from(stdin || '').toString('base64');
+
+        let submitResponse;
+        if (JUDGE0_API_KEY) {
+            submitResponse = await axios.post(`https://${JUDGE0_HOST}/submissions`, {
+                source_code: b64Source,
+                language_id: languageId,
+                stdin: b64Stdin,
+            }, {
+                params: { wait: true, base64_encoded: true },
+                headers: {
+                    'X-RapidAPI-Key': JUDGE0_API_KEY,
+                    'X-RapidAPI-Host': JUDGE0_HOST,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 10000
+            });
+        } else {
+            // Free Public Judge0 CE (No API Key Required)
+            submitResponse = await axios.post('https://ce.judge0.com/submissions?wait=true&base64_encoded=true', {
+                source_code: b64Source,
+                language_id: languageId,
+                stdin: b64Stdin,
+            }, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 12000
+            });
+        }
 
         const { stdout, stderr, compile_output, message, status } = submitResponse.data;
 
-        const decodedStdout = stdout ? Buffer.from(stdout, 'base64').toString() : '';
+        const decodedStdout = stdout ? Buffer.from(stdout, 'base64').toString('utf8') : '';
         const decodedStderr = (stderr || compile_output || message) ?
-            Buffer.from(stderr || compile_output || message, 'base64').toString() : '';
+            Buffer.from(stderr || compile_output || message, 'base64').toString('utf8') : '';
 
         return {
             run: {
                 stdout: decodedStdout,
                 stderr: decodedStderr,
-                code: status.id === 3 ? 0 : 1, // 3 is "Accepted"
-                output: decodedStdout || decodedStderr,
-                status: status.description
+                code: status?.id === 3 ? 0 : 1, // 3 is "Accepted"
+                output: decodedStdout || decodedStderr || (status?.description || 'Executed'),
+                status: status?.description || 'Executed'
             },
-            language
+            language: lang
         };
     } catch (err) {
-        console.error('[Judge0 Error]', err.message);
-        throw new Error(`Execution failed: ${err.message}`);
+        console.error('[CodeExec Error]', err.message);
+        return {
+            run: {
+                stdout: '',
+                stderr: `Execution error: ${err.message}`,
+                code: 1,
+                output: `Execution error: ${err.message}`,
+                status: 'Error'
+            },
+            language: lang
+        };
     }
 };
 
