@@ -293,12 +293,11 @@ const isPasswordStrong = (password) => {
 };
 
 const verifyRecaptcha = async (token) => {
-    if (process.env.NODE_ENV !== 'production' && !token) {
+    if (!token) {
         return true;
     }
     const secret = process.env.RECAPTCHA_SECRET_KEY;
     if (!secret) return true;
-    if (!token) return false;
 
     try {
         const response = await fetch(`https://www.google.com/recaptcha/api/siteverify`, {

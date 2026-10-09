@@ -19,6 +19,12 @@ export default defineConfig(({ mode }) => ({
         changeOrigin: true,
         secure: false,
       },
+      // Socket.io WebSockets proxy for local dev
+      '/socket.io': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+        ws: true,
+      },
     },
   },
   optimizeDeps: {
