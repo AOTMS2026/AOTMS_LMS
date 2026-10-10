@@ -39,10 +39,23 @@ export interface Question {
   topic: string;
   question_text: string;
   type: string;
+  language?: string;
   difficulty: string;
   options: { text: string; is_correct: boolean }[] | null;
   correct_answer: string;
   explanation: string | null;
+  input_format?: string | null;
+  output_format?: string | null;
+  constraints?: string | null;
+  sample_input?: string | null;
+  sample_output?: string | null;
+  test_cases?: {
+    input?: string;
+    expected_output?: string;
+    explanation?: string;
+    weight?: number;
+    is_hidden?: boolean;
+  }[];
   marks: number | null;
   created_by: string;
   is_active?: boolean;
